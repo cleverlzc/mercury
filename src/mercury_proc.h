@@ -18,28 +18,27 @@
 #include <stdlib.h>
 #include <string.h>
 #ifdef HG_HAS_XDR
-#include <rpc/types.h>
-#include <rpc/xdr.h>
-#    ifdef __APPLE__
-#        define xdr_int8_t   xdr_char
-#        define xdr_uint8_t  xdr_u_char
-#        define xdr_uint16_t xdr_u_int16_t
-#        define xdr_uint32_t xdr_u_int32_t
-#        define xdr_uint64_t xdr_u_int64_t
-#    endif
+# include <rpc/types.h>
+# include <rpc/xdr.h>
+# ifdef __APPLE__
+#  define xdr_int8_t   xdr_char
+#  define xdr_uint8_t  xdr_u_char
+#  define xdr_uint16_t xdr_u_int16_t
+#  define xdr_uint32_t xdr_u_int32_t
+#  define xdr_uint64_t xdr_u_int64_t
+# endif
 #endif
 
 /*****************/
 /* Public Macros */
 /*****************/
 
-/* FIXME: this is based on mchecksum's currently supported hash methods, which
- * aren't exposed. The largest is crc64. There must be a better way... */
-#ifdef HG_HAS_CHECKSUMS
-#    define HG_CHECKSUM_MAX_SIZE 8
-#else
-#    define HG_CHECKSUM_MAX_SIZE 0
-#endif
+/* Encode/decode version number into uint32 */
+#define HG_GET_MAJOR(value) ((value >> 24) & 0xFF)
+#define HG_GET_MINOR(value) ((value >> 16) & 0xFF)
+#define HG_GET_PATCH(value) (value & 0xFFFF)
+#define HG_VERSION ((HG_VERSION_MAJOR << 24) | (HG_VERSION_MINOR << 16) \
+        | HG_VERSION_PATCH)
 
 /*********************/
 /* Public Prototypes */
@@ -282,8 +281,8 @@ hg_proc_set_extra_buf_is_mine(
         );
 
 /**
- * Flush the proc after data has been encoded or decoded and verify data using
- * base checksum if available.
+ * Flush the proc after data has been encoded or decoded and finalize internal
+ * checksum if checksum of data processed was initially requested.
  *
  * \param proc [IN]             abstract processor object
  *
@@ -311,6 +310,44 @@ hg_proc_memcpy(
         hg_size_t data_size
         );
 
+#ifdef HG_HAS_CHECKSUMS
+/**
+ * Retrieve internal proc checksum hash.
+ * \remark Must be used after hg_proc_flush() has been called so that the
+ * internally computed checksum is in a finalized state.
+ *
+ * \param proc [IN/OUT]         abstract processor object
+ * \param hash [IN/OUT]         pointer to hash
+ * \param hash_size [IN]        hash size
+ *
+ * \return HG_SUCCESS or corresponding HG error code
+ */
+HG_EXPORT hg_return_t
+hg_proc_checksum_get(
+        hg_proc_t proc,
+        void *hash,
+        hg_size_t hash_size
+        );
+
+/**
+ * Verify that the hash passed matches the internal proc checksum.
+ * \remark Must be used after hg_proc_flush() has been called so that the
+ * internally computed checksum is in a finalized state.
+ *
+ * \param proc [IN/OUT]         abstract processor object
+ * \param hash [IN]             pointer to hash
+ * \param hash_size [IN]        hash size
+ *
+ * \return HG_SUCCESS if matches or corresponding HG error code
+ */
+HG_EXPORT hg_return_t
+hg_proc_checksum_verify(
+        hg_proc_t proc,
+        const void *hash,
+        hg_size_t hash_size
+        );
+#endif
+
 /**
  * Inline prototypes (do not remove)
  */
@@ -331,10 +368,7 @@ static HG_INLINE hg_return_t hg_proc_hg_int64_t(hg_proc_t proc,
 static HG_INLINE hg_return_t hg_proc_hg_uint64_t(hg_proc_t proc,
         void *data);
 static HG_INLINE hg_return_t hg_proc_hg_bulk_t(hg_proc_t proc,
-        void *handle);
-static HG_INLINE void *hg_proc_buf_memcpy(void *buf, void *data,
-    hg_size_t data_size, hg_proc_op_t op);
-
+        void *data);
 
 /* Note: float types are not supported but can be built on top of the existing
  * proc routines; encoding floats using XDR could modify checksum */
@@ -342,23 +376,23 @@ static HG_INLINE void *hg_proc_buf_memcpy(void *buf, void *data,
 /**
  * For convenience map stdint types to hg types
  */
-#define hg_proc_int8_t   hg_proc_hg_int8_t
-#define hg_proc_uint8_t  hg_proc_hg_uint8_t
-#define hg_proc_int16_t  hg_proc_hg_int16_t
-#define hg_proc_uint16_t hg_proc_hg_uint16_t
-#define hg_proc_int32_t  hg_proc_hg_int32_t
-#define hg_proc_uint32_t hg_proc_hg_uint32_t
-#define hg_proc_int64_t  hg_proc_hg_int64_t
-#define hg_proc_uint64_t hg_proc_hg_uint64_t
+#define hg_proc_int8_t      hg_proc_hg_int8_t
+#define hg_proc_uint8_t     hg_proc_hg_uint8_t
+#define hg_proc_int16_t     hg_proc_hg_int16_t
+#define hg_proc_uint16_t    hg_proc_hg_uint16_t
+#define hg_proc_int32_t     hg_proc_hg_int32_t
+#define hg_proc_uint32_t    hg_proc_hg_uint32_t
+#define hg_proc_int64_t     hg_proc_hg_int64_t
+#define hg_proc_uint64_t    hg_proc_hg_uint64_t
 
 /* Map mercury common types */
-#define hg_proc_hg_bool_t     hg_proc_hg_uint8_t
-#define hg_proc_hg_ptr_t      hg_proc_hg_uint64_t
-#define hg_proc_hg_size_t     hg_proc_hg_uint64_t
-#define hg_proc_hg_id_t       hg_proc_hg_uint32_t
+#define hg_proc_hg_bool_t   hg_proc_hg_uint8_t
+#define hg_proc_hg_ptr_t    hg_proc_hg_uint64_t
+#define hg_proc_hg_size_t   hg_proc_hg_uint64_t
+#define hg_proc_hg_id_t     hg_proc_hg_uint32_t
 
 /* For now, map hg_proc_raw to hg_proc_memcpy */
-#define hg_proc_raw     hg_proc_memcpy
+#define hg_proc_raw         hg_proc_memcpy
 
 
 /**
@@ -530,27 +564,27 @@ hg_proc_hg_uint64_t(hg_proc_t proc, void *data)
  * \return HG_SUCCESS or corresponding HG error code
  */
 static HG_INLINE hg_return_t
-hg_proc_hg_bulk_t(hg_proc_t proc, void *handle)
+hg_proc_hg_bulk_t(hg_proc_t proc, void *data)
 {
     hg_return_t ret = HG_SUCCESS;
     void *buf = NULL;
-    hg_bulk_t *bulk = (hg_bulk_t*)handle;
+    hg_bulk_t *bulk_ptr = (hg_bulk_t *) data;
     hg_uint64_t buf_size = 0;
 
     switch (hg_proc_get_op(proc)) {
         case HG_ENCODE: {
             hg_bool_t request_eager = HG_FALSE;
 
-            if (*bulk == HG_BULK_NULL) {
+            if (*bulk_ptr == HG_BULK_NULL) {
                 /* If HG_BULK_NULL set 0 to buf_size */
                 buf_size = 0;
             } else {
 #ifdef HG_HAS_EAGER_BULK
                 request_eager = (hg_proc_get_size_left(proc)
-                    > HG_Bulk_get_serialize_size(*bulk, HG_TRUE))
+                    > HG_Bulk_get_serialize_size(*bulk_ptr, HG_TRUE))
                     ? HG_TRUE : HG_FALSE;
 #endif
-                buf_size = HG_Bulk_get_serialize_size(*bulk, request_eager);
+                buf_size = HG_Bulk_get_serialize_size(*bulk_ptr, request_eager);
             }
             /* Encode size */
             ret = hg_proc_uint64_t(proc, &buf_size);
@@ -560,7 +594,7 @@ hg_proc_hg_bulk_t(hg_proc_t proc, void *handle)
             }
             if (buf_size) {
                 buf = hg_proc_save_ptr(proc, buf_size);
-                ret = HG_Bulk_serialize(buf, buf_size, request_eager, *bulk);
+                ret = HG_Bulk_serialize(buf, buf_size, request_eager, *bulk_ptr);
                 if (ret != HG_SUCCESS) {
                     HG_LOG_ERROR("Could not serialize bulk handle");
                     return ret;
@@ -580,7 +614,7 @@ hg_proc_hg_bulk_t(hg_proc_t proc, void *handle)
                 hg_class_t *hg_class = hg_proc_get_class(proc);
 
                 buf = hg_proc_save_ptr(proc, buf_size);
-                ret = HG_Bulk_deserialize(hg_class, bulk, buf, buf_size);
+                ret = HG_Bulk_deserialize(hg_class, bulk_ptr, buf, buf_size);
                 if (ret != HG_SUCCESS) {
                     HG_LOG_ERROR("Could not deserialize bulk handle");
                     return ret;
@@ -588,17 +622,17 @@ hg_proc_hg_bulk_t(hg_proc_t proc, void *handle)
                 hg_proc_restore_ptr(proc, buf, buf_size);
             } else {
                 /* If buf_size is 0, define handle to HG_BULK_NULL */
-                *bulk = HG_BULK_NULL;
+                *bulk_ptr = HG_BULK_NULL;
             }
             break;
         case HG_FREE:
-            if (*bulk != HG_BULK_NULL) {
-                ret = HG_Bulk_free(*bulk);
+            if (*bulk_ptr != HG_BULK_NULL) {
+                ret = HG_Bulk_free(*bulk_ptr);
                 if (ret != HG_SUCCESS) {
                     HG_LOG_ERROR("Could not free bulk handle");
                     return ret;
                 }
-                *bulk = HG_BULK_NULL;
+                *bulk_ptr = HG_BULK_NULL;
             } else {
                 /* If *bulk is HG_BULK_NULL, just return success */
                 ret = HG_SUCCESS;
@@ -608,31 +642,6 @@ hg_proc_hg_bulk_t(hg_proc_t proc, void *handle)
             break;
     }
     return ret;
-}
-
-/**
- * Copy data to buf if HG_ENCODE or buf to data if HG_DECODE and return
- * incremented pointer to buf.
- *
- * \param buf [IN/OUT]          abstract processor object
- * \param data [IN/OUT]         pointer to data
- * \param data_size [IN]        data size
- * \param op [IN]               operation type: HG_ENCODE / HG_DECODE
- *
- * \return incremented pointer to buf
- */
-static HG_INLINE void *
-hg_proc_buf_memcpy(void *buf, void *data, hg_size_t data_size, hg_proc_op_t op)
-{
-    const void *src = NULL;
-    void *dest = NULL;
-
-    if ((op != HG_ENCODE) && (op != HG_DECODE)) return NULL;
-    src = (op == HG_ENCODE) ? (const void *) data : (const void *) buf;
-    dest = (op == HG_ENCODE) ? buf : data;
-    memcpy(dest, src, data_size);
-
-    return ((char *) buf + data_size);
 }
 
 #ifdef __cplusplus

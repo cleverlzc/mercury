@@ -1079,11 +1079,46 @@ HG_TEST_RPC_CB(hg_test_perf_rpc, handle)
 }
 
 /*---------------------------------------------------------------------------*/
+HG_TEST_RPC_CB(hg_test_perf_rpc_lat, handle)
+{
+    hg_return_t ret = HG_SUCCESS;
+
+#ifdef MERCURY_TESTING_HAS_VERIFY_DATA
+    perf_rpc_lat_in_t in_struct;
+
+    /* Get input struct */
+    ret = HG_Get_input(handle, &in_struct);
+    if (ret != HG_SUCCESS) {
+        fprintf(stderr, "Could not get input struct\n");
+        return ret;
+    }
+
+    HG_Free_input(handle, &in_struct);
+#endif
+
+    /* Send response back */
+    ret = HG_Respond(handle, NULL, NULL, NULL);
+    if (ret != HG_SUCCESS) {
+        fprintf(stderr, "Could not respond\n");
+        return ret;
+    }
+
+    HG_Destroy(handle);
+
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
 static hg_return_t
 hg_test_perf_bulk_transfer_cb(const struct hg_cb_info *hg_cb_info)
 {
-    struct hg_test_bulk_args *bulk_args = (struct hg_test_bulk_args *)
-            hg_cb_info->arg;
+    hg_handle_t handle = (hg_handle_t) hg_cb_info->arg;
+#ifdef MERCURY_TESTING_HAS_VERIFY_DATA
+    size_t size = HG_Bulk_get_size(hg_cb_info->info.bulk.origin_handle);
+    void *buf;
+    const char *buf_ptr;
+    size_t i;
+#endif
     hg_return_t ret = HG_SUCCESS;
 
 #ifdef MERCURY_TESTING_USE_LOCAL_BULK
@@ -1094,18 +1129,30 @@ hg_test_perf_bulk_transfer_cb(const struct hg_cb_info *hg_cb_info)
         goto done;
     }
 #endif
+#ifdef MERCURY_TESTING_HAS_VERIFY_DATA
+    HG_Bulk_access(hg_cb_info->info.bulk.local_handle, 0,
+        size, HG_BULK_READWRITE, 1, &buf, NULL, NULL);
+
+    /* Check bulk buf */
+    buf_ptr = (const char*) buf;
+    for (i = 0; i < size; i++) {
+        if (buf_ptr[i] != (char) i) {
+            printf("Error detected in bulk transfer, buf[%d] = %d, "
+                "was expecting %d!\n", (int) i, (char) buf_ptr[i], (char) i);
+            break;
+        }
+    }
+#endif
 
     /* Send response back */
-    ret = HG_Respond(bulk_args->handle, NULL, NULL, NULL);
+    ret = HG_Respond(handle, NULL, NULL, NULL);
     if (ret != HG_SUCCESS) {
         fprintf(stderr, "Could not respond\n");
         goto done;
     }
 
 done:
-    HG_Destroy(bulk_args->handle);
-    free(bulk_args);
-
+    HG_Destroy(handle);
     return ret;
 }
 
@@ -1116,14 +1163,7 @@ HG_TEST_RPC_CB(hg_test_perf_bulk, handle)
     const struct hg_info *hg_info = NULL;
     hg_bulk_t origin_bulk_handle = HG_BULK_NULL;
     hg_bulk_t local_bulk_handle = HG_BULK_NULL;
-    struct hg_test_bulk_args *bulk_args = NULL;
     bulk_write_in_t in_struct;
-
-    bulk_args = (struct hg_test_bulk_args *) malloc(
-            sizeof(struct hg_test_bulk_args));
-
-    /* Keep handle to pass to callback */
-    bulk_args->handle = handle;
 
     /* Get info from handle */
     hg_info = HG_Get_info(handle);
@@ -1136,11 +1176,6 @@ HG_TEST_RPC_CB(hg_test_perf_bulk, handle)
     }
 
     origin_bulk_handle = in_struct.bulk_handle;
-    hg_atomic_set32(&bulk_args->completed_transfers, 0);
-
-    /* Create a new block handle to read the data */
-    bulk_args->nbytes = HG_Bulk_get_size(origin_bulk_handle);
-    bulk_args->fildes = in_struct.fildes;
 
 #ifdef MERCURY_TESTING_USE_LOCAL_BULK
     /* Create a new bulk handle to read the data */
@@ -1155,9 +1190,61 @@ HG_TEST_RPC_CB(hg_test_perf_bulk, handle)
 
     /* Pull bulk data */
     ret = HG_Bulk_transfer(hg_info->context, hg_test_perf_bulk_transfer_cb,
-            bulk_args, HG_BULK_PULL, hg_info->addr, hg_info->target_id,
-            origin_bulk_handle, 0, local_bulk_handle, 0, bulk_args->nbytes,
-            HG_OP_ID_IGNORE);
+            handle, HG_BULK_PULL, hg_info->addr, hg_info->target_id,
+            origin_bulk_handle, 0, local_bulk_handle, 0,
+            HG_Bulk_get_size(origin_bulk_handle), HG_OP_ID_IGNORE);
+    if (ret != HG_SUCCESS) {
+        fprintf(stderr, "Could not read bulk data\n");
+        return ret;
+    }
+
+#ifndef MERCURY_TESTING_USE_LOCAL_BULK
+#ifdef MERCURY_TESTING_HAS_THREAD_POOL
+    hg_thread_mutex_unlock(&hg_test_local_bulk_handle_mutex_g);
+#endif
+#endif
+
+    HG_Free_input(handle, &in_struct);
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+HG_TEST_RPC_CB(hg_test_perf_bulk_read, handle)
+{
+    hg_return_t ret = HG_SUCCESS;
+    const struct hg_info *hg_info = NULL;
+    hg_bulk_t origin_bulk_handle = HG_BULK_NULL;
+    hg_bulk_t local_bulk_handle = HG_BULK_NULL;
+    bulk_write_in_t in_struct;
+
+    /* Get info from handle */
+    hg_info = HG_Get_info(handle);
+
+    /* Get input struct */
+    ret = HG_Get_input(handle, &in_struct);
+    if (ret != HG_SUCCESS) {
+        fprintf(stderr, "Could not get input struct\n");
+        return ret;
+    }
+
+    origin_bulk_handle = in_struct.bulk_handle;
+
+#ifdef MERCURY_TESTING_USE_LOCAL_BULK
+    /* Create a new bulk handle to read the data */
+    HG_Bulk_create(hg_info->hg_class, 1, NULL, &bulk_args->nbytes,
+            HG_BULK_READWRITE, &local_bulk_handle);
+#else
+#ifdef MERCURY_TESTING_HAS_THREAD_POOL
+    hg_thread_mutex_lock(&hg_test_local_bulk_handle_mutex_g);
+#endif
+    local_bulk_handle = hg_test_local_bulk_handle_g;
+#endif
+
+    /* Pull bulk data */
+    ret = HG_Bulk_transfer(hg_info->context, hg_test_perf_bulk_transfer_cb,
+            handle, HG_BULK_PUSH, hg_info->addr, hg_info->target_id,
+            origin_bulk_handle, 0, local_bulk_handle, 0,
+            HG_Bulk_get_size(origin_bulk_handle), HG_OP_ID_IGNORE);
     if (ret != HG_SUCCESS) {
         fprintf(stderr, "Could not read bulk data\n");
         return ret;
@@ -1176,12 +1263,14 @@ HG_TEST_RPC_CB(hg_test_perf_bulk, handle)
 /*---------------------------------------------------------------------------*/
 HG_TEST_RPC_CB(hg_test_overflow, handle)
 {
+    size_t max_size =
+        HG_Class_get_output_eager_size(HG_Get_info(handle)->hg_class);
     hg_return_t ret = HG_SUCCESS;
 
     overflow_out_t out_struct;
 
     hg_string_t string;
-    size_t string_len = 1024 * 4;
+    size_t string_len = max_size * 2;
 
     string = (hg_string_t) malloc(string_len + 1);
     memset(string, 'h', string_len);
@@ -1290,7 +1379,9 @@ HG_TEST_THREAD_CB(hg_test_posix_write)
 HG_TEST_THREAD_CB(hg_test_posix_read)
 #endif
 HG_TEST_THREAD_CB(hg_test_perf_rpc)
+HG_TEST_THREAD_CB(hg_test_perf_rpc_lat)
 HG_TEST_THREAD_CB(hg_test_perf_bulk)
+HG_TEST_THREAD_CB(hg_test_perf_bulk_read)
 HG_TEST_THREAD_CB(hg_test_overflow)
 HG_TEST_THREAD_CB(hg_test_nested1)
 HG_TEST_THREAD_CB(hg_test_nested2)

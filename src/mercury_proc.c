@@ -9,19 +9,13 @@
  */
 
 #include "mercury_proc.h"
+#include "mercury_proc_buf.h"
+#include "mercury_mem.h"
 
 #ifdef HG_HAS_CHECKSUMS
-  #include <mchecksum.h>
-  #include <mchecksum_error.h>
+# include <mchecksum.h>
+# include <mchecksum_error.h>
 #endif
-
-#ifdef _WIN32
-  #include <windows.h>
-#else
-  #include <unistd.h>
-#endif
-#include <stdlib.h>
-#include <string.h>
 
 /****************/
 /* Local Macros */
@@ -40,18 +34,19 @@ struct hg_proc_buf {
 #ifdef HG_HAS_XDR
     XDR      xdr;
 #endif
-#ifdef HG_HAS_CHECKSUMS
-    mchecksum_object_t checksum;    /* Checksum */
-    hg_bool_t     update_checksum;  /* Update checksum on proc operation */
-#endif
 };
 
 struct hg_proc {
     hg_class_t *hg_class;               /* HG class */
     hg_proc_op_t op;
-    struct hg_proc_buf *current_buf;
     struct hg_proc_buf proc_buf;
     struct hg_proc_buf extra_buf;
+    struct hg_proc_buf *current_buf;
+#ifdef HG_HAS_CHECKSUMS
+    mchecksum_object_t checksum;    /* Checksum */
+    void *checksum_hash;            /* Base checksum buf */
+    size_t checksum_size;           /* Checksum size */
+#endif
 };
 
 /********************/
@@ -63,7 +58,7 @@ struct hg_proc {
  */
 #ifdef HG_HAS_CHECKSUMS
 static HG_INLINE hg_return_t
-hg_proc_mchecksum_update(
+hg_proc_checksum_update(
         hg_proc_t proc,
         void *data,
         hg_size_t data_size
@@ -117,21 +112,22 @@ hg_proc_create(hg_class_t *hg_class, hg_proc_hash_t hash, hg_proc_t *proc)
 #ifdef HG_HAS_CHECKSUMS
         int checksum_ret;
 
-        checksum_ret = mchecksum_init(hash_method, &hg_proc->proc_buf.checksum);
+        checksum_ret = mchecksum_init(hash_method, &hg_proc->checksum);
         if (checksum_ret != MCHECKSUM_SUCCESS) {
             HG_LOG_ERROR("Could not initialize checksum");
             ret = HG_CHECKSUM_ERROR;
             goto done;
         }
-        hg_proc->proc_buf.update_checksum = 1;
+
+        hg_proc->checksum_size = mchecksum_get_size(hg_proc->checksum);
+        hg_proc->checksum_hash = (char *) malloc(hg_proc->checksum_size);
+        if (!hg_proc->checksum_hash) {
+            HG_LOG_ERROR("Could not allocate space for checksum hash");
+            ret = HG_NOMEM_ERROR;
+            goto done;
+        }
 #endif
     }
-
-    /* Do not allocate extra buffer yet */
-#ifdef HG_HAS_CHECKSUMS
-    hg_proc->extra_buf.checksum = hg_proc->proc_buf.checksum;
-    hg_proc->extra_buf.update_checksum = hg_proc->proc_buf.update_checksum;
-#endif
 
     /* Default to proc_buf */
     hg_proc->current_buf = &hg_proc->proc_buf;
@@ -181,26 +177,25 @@ hg_proc_free(hg_proc_t proc)
     if (!hg_proc) goto done;
 
 #ifdef HG_HAS_CHECKSUMS
-    if (hg_proc->proc_buf.checksum != MCHECKSUM_OBJECT_NULL) {
+    if (hg_proc->checksum != MCHECKSUM_OBJECT_NULL) {
         int checksum_ret;
 
-        checksum_ret = mchecksum_destroy(hg_proc->proc_buf.checksum);
+        checksum_ret = mchecksum_destroy(hg_proc->checksum);
         if (checksum_ret != MCHECKSUM_SUCCESS) {
             HG_LOG_ERROR("Could not destroy checksum");
             ret = HG_CHECKSUM_ERROR;
         }
     }
+
+    free(hg_proc->checksum_hash);
 #endif
 
     /* Free extra proc buffer if needed */
-    if (hg_proc->extra_buf.buf && hg_proc->extra_buf.is_mine) {
-        free (hg_proc->extra_buf.buf);
-        hg_proc->extra_buf.buf = NULL;
-    }
+    if (hg_proc->extra_buf.buf && hg_proc->extra_buf.is_mine)
+        hg_mem_aligned_free(hg_proc->extra_buf.buf);
 
     /* Free proc */
     free(hg_proc);
-    hg_proc = NULL;
 
 done:
     return ret;
@@ -242,37 +237,33 @@ hg_proc_reset(hg_proc_t proc, void *buf, hg_size_t buf_size, hg_proc_op_t op)
     /* Reset proc buf */
     hg_proc->proc_buf.buf = buf;
     hg_proc->proc_buf.size = buf_size;
-    hg_proc->proc_buf.buf_ptr = buf;
-    hg_proc->proc_buf.size_left = buf_size;
-    hg_proc->proc_buf.is_mine = 0;
+    hg_proc->proc_buf.buf_ptr = hg_proc->proc_buf.buf;
+    hg_proc->proc_buf.size_left = hg_proc->proc_buf.size;
+
+    /* Free extra proc buffer if needed */
+    if (hg_proc->extra_buf.buf && hg_proc->extra_buf.is_mine)
+        hg_mem_aligned_free(hg_proc->extra_buf.buf);
+    hg_proc->extra_buf.buf = NULL;
+    hg_proc->extra_buf.size = 0;
+    hg_proc->extra_buf.buf_ptr = hg_proc->extra_buf.buf;
+    hg_proc->extra_buf.size_left = hg_proc->extra_buf.size;
+
+    /* Default to proc_buf */
+    hg_proc->current_buf = &hg_proc->proc_buf;
+
 #ifdef HG_HAS_CHECKSUMS
     /* Reset checksum */
-    if (hg_proc->proc_buf.checksum != MCHECKSUM_OBJECT_NULL) {
+    if (hg_proc->checksum != MCHECKSUM_OBJECT_NULL) {
         int checksum_ret;
 
-        checksum_ret = mchecksum_reset(hg_proc->proc_buf.checksum);
+        checksum_ret = mchecksum_reset(hg_proc->checksum);
         if (checksum_ret != MCHECKSUM_SUCCESS) {
             HG_LOG_ERROR("Could not reset checksum");
             ret = HG_CHECKSUM_ERROR;
         }
-        hg_proc->proc_buf.update_checksum = 1;
+        memset(hg_proc->checksum_hash, 0, hg_proc->checksum_size);
     }
 #endif
-
-    /* Reset extra buf */
-    hg_proc->extra_buf.buf = NULL;
-    hg_proc->extra_buf.size = 0;
-    hg_proc->extra_buf.buf_ptr = NULL;
-    hg_proc->extra_buf.size_left = 0;
-    hg_proc->extra_buf.is_mine = 0;
-    /* Do not allocate extra buffer yet */
-#ifdef HG_HAS_CHECKSUMS
-    hg_proc->extra_buf.checksum = hg_proc->proc_buf.checksum;
-    hg_proc->extra_buf.update_checksum = hg_proc->proc_buf.update_checksum;
-#endif
-
-    /* Default to proc_buf */
-    hg_proc->current_buf = &hg_proc->proc_buf;
 
 done:
     return ret;
@@ -344,10 +335,7 @@ hg_proc_get_size_used(hg_proc_t proc)
         goto done;
     }
 
-    if(hg_proc->extra_buf.size > 0)
-        size = (hg_proc->proc_buf.size + hg_proc->extra_buf.size) - hg_proc->extra_buf.size_left;
-    else
-        size = hg_proc->proc_buf.size - hg_proc->proc_buf.size_left;
+    size = hg_proc->current_buf->size - hg_proc->current_buf->size_left;
 
 done:
     return size;
@@ -360,19 +348,17 @@ hg_proc_set_size(hg_proc_t proc, hg_size_t req_buf_size)
 {
     struct hg_proc *hg_proc = (struct hg_proc *) proc;
     hg_size_t new_buf_size;
-    hg_size_t page_size;
+    hg_size_t page_size = (hg_size_t) hg_mem_get_page_size();
+    void *new_buf = NULL;
     ptrdiff_t current_pos;
     hg_return_t ret = HG_SUCCESS;
 
-#ifdef _WIN32
-    SYSTEM_INFO system_info;
-    GetSystemInfo(&system_info);
-    page_size = system_info.dwPageSize;
-#else
-    page_size = (hg_size_t) sysconf(_SC_PAGE_SIZE);
-#endif
-    new_buf_size = ((hg_size_t)(req_buf_size / page_size) + 1) * page_size;
+    /* Save current position */
+    current_pos = (char *) hg_proc->current_buf->buf_ptr -
+        (char *) hg_proc->current_buf->buf;
 
+    /* Get one more page size buf */
+    new_buf_size = ((hg_size_t)(req_buf_size / page_size) + 1) * page_size;
     if (new_buf_size <= hg_proc_get_size(proc)) {
         HG_LOG_ERROR("Buffer is already of the size requested");
         ret = HG_SIZE_ERROR;
@@ -380,46 +366,30 @@ hg_proc_set_size(hg_proc_t proc, hg_size_t req_buf_size)
     }
 
     /* If was not using extra buffer init extra buffer */
-    if (!hg_proc->extra_buf.buf) {
-        /* Save current position */
-        current_pos = (char *) hg_proc->proc_buf.buf_ptr -
-                (char *) hg_proc->proc_buf.buf;
-
+    if (!hg_proc->extra_buf.buf)
         /* Allocate buffer */
-        hg_proc->extra_buf.buf = malloc(new_buf_size);
-        if (!hg_proc->extra_buf.buf) {
-            HG_LOG_ERROR("Could not allocate buffer");
-            ret = HG_NOMEM_ERROR;
-            goto done;
-        }
+        new_buf = hg_mem_aligned_alloc(page_size, new_buf_size);
+    else
+        new_buf = realloc(hg_proc->extra_buf.buf, new_buf_size);
+    if (!new_buf) {
+        HG_LOG_ERROR("Could not allocate buffer of size %zu", new_buf_size);
+        ret = HG_NOMEM_ERROR;
+        goto done;
+    }
 
+    if (!hg_proc->extra_buf.buf) {
         /* Copy proc_buf (should be small) */
-        memcpy(hg_proc->extra_buf.buf, hg_proc->proc_buf.buf, (size_t) current_pos);
-        hg_proc->extra_buf.size = new_buf_size;
-        hg_proc->extra_buf.buf_ptr = (char *) hg_proc->extra_buf.buf + current_pos;
-        hg_proc->extra_buf.size_left = hg_proc->extra_buf.size - (size_t) current_pos;
-        hg_proc->extra_buf.is_mine = 1;
+        memcpy(new_buf, hg_proc->proc_buf.buf, (size_t) current_pos);
 
         /* Switch buffer */
         hg_proc->current_buf = &hg_proc->extra_buf;
-    } else {
-        void *new_buf = NULL;
-
-        /* Save current position */
-        current_pos = (char *) hg_proc->extra_buf.buf_ptr - (char *) hg_proc->extra_buf.buf;
-
-        /* Reallocate buffer */
-        new_buf = realloc(hg_proc->extra_buf.buf, new_buf_size);
-        if (!new_buf) {
-            HG_LOG_ERROR("Could not reallocate buffer");
-            ret = HG_NOMEM_ERROR;
-            goto done;
-        }
-        hg_proc->extra_buf.buf = new_buf;
-        hg_proc->extra_buf.size = new_buf_size;
-        hg_proc->extra_buf.buf_ptr = (char *) hg_proc->extra_buf.buf + current_pos;
-        hg_proc->extra_buf.size_left = hg_proc->extra_buf.size - (size_t) current_pos;
     }
+
+    hg_proc->extra_buf.buf = new_buf;
+    hg_proc->extra_buf.size = new_buf_size;
+    hg_proc->extra_buf.buf_ptr = (char *) hg_proc->extra_buf.buf + current_pos;
+    hg_proc->extra_buf.size_left = hg_proc->extra_buf.size - (hg_size_t) current_pos;
+    hg_proc->extra_buf.is_mine = HG_TRUE;
 
 done:
     return ret;
@@ -460,10 +430,9 @@ hg_proc_save_ptr(hg_proc_t proc, hg_size_t data_size)
 
     /* If not enough space allocate extra space if encoding or
      * just get extra buffer if decoding */
-    if (data_size && hg_proc->current_buf->size_left < data_size) {
+    if (data_size && hg_proc->current_buf->size_left < data_size)
         hg_proc_set_size(proc, hg_proc->proc_buf.size +
                 hg_proc->extra_buf.size + data_size);
-    }
 
     ptr = hg_proc->current_buf->buf_ptr;
     hg_proc->current_buf->buf_ptr = (char *) hg_proc->current_buf->buf_ptr + data_size;
@@ -500,7 +469,7 @@ hg_proc_restore_ptr(hg_proc_t proc, void *data, hg_size_t data_size)
     hg_return_t ret = HG_SUCCESS;
 
 #ifdef HG_HAS_CHECKSUMS
-    ret = hg_proc_mchecksum_update(proc, data, data_size);
+    ret = hg_proc_checksum_update(proc, data, data_size);
     if (ret != HG_SUCCESS) {
         HG_LOG_ERROR("Could not update checksum");
         goto done;
@@ -522,13 +491,8 @@ void *
 hg_proc_get_extra_buf(hg_proc_t proc)
 {
     struct hg_proc *hg_proc = (struct hg_proc *) proc;
-    void *extra_buf = NULL;
 
-    if (hg_proc->extra_buf.buf) {
-        extra_buf = hg_proc->extra_buf.buf;
-    }
-
-    return extra_buf;
+    return hg_proc->extra_buf.buf;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -536,13 +500,8 @@ hg_size_t
 hg_proc_get_extra_size(hg_proc_t proc)
 {
     struct hg_proc *hg_proc = (struct hg_proc *) proc;
-    hg_size_t extra_size = 0;
 
-    if (hg_proc->extra_buf.buf) {
-        extra_size = hg_proc->extra_buf.size;
-    }
-
-    return extra_size;
+    return hg_proc->extra_buf.size;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -569,11 +528,7 @@ hg_proc_flush(hg_proc_t proc)
 {
     struct hg_proc *hg_proc = (struct hg_proc *) proc;
 #ifdef HG_HAS_CHECKSUMS
-    hg_bool_t current_update_checksum;
-    hg_size_t checksum_size;
-    char *base_checksum = NULL;
-    char *new_checksum = NULL;
-    int checksum_ret, cmp_ret;
+    int checksum_ret;
 #endif
     hg_return_t ret = HG_SUCCESS;
 
@@ -584,72 +539,16 @@ hg_proc_flush(hg_proc_t proc)
     }
 
 #ifdef HG_HAS_CHECKSUMS
-    current_update_checksum = hg_proc->current_buf->update_checksum;
-    if (!current_update_checksum) {
-        /* Checksum was not enabled so do nothing here */
+    checksum_ret = mchecksum_get(hg_proc->checksum, hg_proc->checksum_hash,
+        hg_proc->checksum_size, MCHECKSUM_FINALIZE);
+    if (checksum_ret != MCHECKSUM_SUCCESS) {
+        HG_LOG_ERROR("Could not get checksum");
+        ret = HG_CHECKSUM_ERROR;
         goto done;
-    }
-
-    /* Disable checksum update now */
-    hg_proc->current_buf->update_checksum = 0;
-
-    checksum_size = mchecksum_get_size(hg_proc->current_buf->checksum);
-    base_checksum = (char *) malloc(checksum_size);
-    if (!base_checksum) {
-        HG_LOG_ERROR("Could not allocate space for base checksum");
-        ret = HG_NOMEM_ERROR;
-        goto done;
-    }
-
-    if (hg_proc_get_op(proc) == HG_ENCODE) {
-        checksum_ret = mchecksum_get(hg_proc->current_buf->checksum,
-                base_checksum, checksum_size, MCHECKSUM_FINALIZE);
-        if (checksum_ret != MCHECKSUM_SUCCESS) {
-            HG_LOG_ERROR("Could not get checksum");
-            ret = HG_CHECKSUM_ERROR;
-            goto done;
-        }
-    }
-
-    /* Process checksum (TODO should that depend on the encoding method) */
-    ret = hg_proc_memcpy(proc, base_checksum, checksum_size);
-    if (ret != HG_SUCCESS) {
-        HG_LOG_ERROR("Proc error");
-        goto done;
-    }
-
-    if (hg_proc_get_op(proc) == HG_DECODE) {
-        new_checksum = (char *) malloc(checksum_size);
-        if (!new_checksum) {
-            HG_LOG_ERROR("Could not allocate checksum");
-            ret = HG_NOMEM_ERROR;
-            goto done;
-        }
-
-        checksum_ret = mchecksum_get(hg_proc->current_buf->checksum,
-                new_checksum, checksum_size, MCHECKSUM_FINALIZE);
-        if (checksum_ret != MCHECKSUM_SUCCESS) {
-            HG_LOG_ERROR("Could not get checksum");
-            ret = HG_CHECKSUM_ERROR;
-            goto done;
-        }
-
-        /* Verify checksums */
-        cmp_ret = strncmp(base_checksum, new_checksum, checksum_size);
-        if (cmp_ret != 0) {
-            HG_LOG_ERROR("Checksums do not match");
-            ret = HG_CHECKSUM_ERROR;
-            goto done;
-        }
     }
 #endif
 
 done:
-#ifdef HG_HAS_CHECKSUMS
-    free(base_checksum);
-    free(new_checksum);
-#endif
-
     return ret;
 }
 
@@ -670,10 +569,9 @@ hg_proc_memcpy(hg_proc_t proc, void *data, hg_size_t data_size)
 
     /* If not enough space allocate extra space if encoding or
      * just get extra buffer if decoding */
-    if (hg_proc->current_buf->size_left < data_size) {
+    if (hg_proc->current_buf->size_left < data_size)
         hg_proc_set_size(proc, hg_proc->proc_buf.size +
                 hg_proc->extra_buf.size + data_size);
-    }
 
     /* Process data */
     hg_proc->current_buf->buf_ptr =
@@ -682,7 +580,7 @@ hg_proc_memcpy(hg_proc_t proc, void *data, hg_size_t data_size)
     hg_proc->current_buf->size_left -= data_size;
 
 #ifdef HG_HAS_CHECKSUMS
-    ret = hg_proc_mchecksum_update(proc, data, data_size);
+    ret = hg_proc_checksum_update(proc, data, data_size);
     if (ret != HG_SUCCESS) {
         HG_LOG_ERROR("Could not update checksum");
         goto done;
@@ -696,7 +594,33 @@ done:
 #ifdef HG_HAS_CHECKSUMS
 /*---------------------------------------------------------------------------*/
 static HG_INLINE hg_return_t
-hg_proc_mchecksum_update(hg_proc_t proc, void *data, hg_size_t data_size)
+hg_proc_checksum_update(hg_proc_t proc, void *data, hg_size_t data_size)
+{
+    struct hg_proc *hg_proc = (struct hg_proc *) proc;
+    int checksum_ret;
+    hg_return_t ret = HG_SUCCESS;
+
+    if (!hg_proc) {
+        HG_LOG_ERROR("Proc is not initialized");
+        ret = HG_INVALID_PARAM;
+        goto done;
+    }
+
+    /* Update checksum */
+    checksum_ret = mchecksum_update(hg_proc->checksum, data, data_size);
+    if (checksum_ret != MCHECKSUM_SUCCESS) {
+        HG_LOG_ERROR("Could not update checksum");
+        ret = HG_CHECKSUM_ERROR;
+        goto done;
+    }
+
+done:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+hg_return_t
+hg_proc_checksum_get(hg_proc_t proc, void *hash, hg_size_t hash_size)
 {
     struct hg_proc *hg_proc = (struct hg_proc *) proc;
     hg_return_t ret = HG_SUCCESS;
@@ -707,17 +631,61 @@ hg_proc_mchecksum_update(hg_proc_t proc, void *data, hg_size_t data_size)
         goto done;
     }
 
-    /* Update checksum */
-    if (hg_proc->current_buf->update_checksum) {
-        int checksum_ret;
+    if (!hash) {
+        HG_LOG_ERROR("NULL hash pointer");
+        ret = HG_INVALID_PARAM;
+        goto done;
+    }
 
-        checksum_ret = mchecksum_update(hg_proc->current_buf->checksum, data,
-                data_size);
-        if (checksum_ret != MCHECKSUM_SUCCESS) {
-            HG_LOG_ERROR("Could not update checksum");
-            ret = HG_CHECKSUM_ERROR;
-            goto done;
-        }
+    if (hash_size < hg_proc->checksum_size) {
+        HG_LOG_ERROR("Hash size passed is too small");
+        ret = HG_INVALID_PARAM;
+        goto done;
+    }
+
+    memcpy(hash, hg_proc->checksum_hash, hg_proc->checksum_size);
+
+done:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+hg_return_t
+hg_proc_checksum_verify(hg_proc_t proc, const void *hash, hg_size_t hash_size)
+{
+    struct hg_proc *hg_proc = (struct hg_proc *) proc;
+    hg_return_t ret = HG_SUCCESS;
+
+    if (!hg_proc) {
+        HG_LOG_ERROR("Proc is not initialized");
+        ret = HG_INVALID_PARAM;
+        goto done;
+    }
+
+    if (hash_size < hg_proc->checksum_size) {
+        HG_LOG_ERROR("Hash size is not valid");
+        ret = HG_SIZE_ERROR;
+        goto done;
+    }
+
+    /* Verify checksums */
+    if (memcmp(hash, hg_proc->checksum_hash, hg_proc->checksum_size) != 0) {
+        if (hg_proc->checksum_size == sizeof(hg_uint16_t))
+            HG_LOG_ERROR("checksum 0x%04X does not match (expected 0x%04X!)",
+                *(hg_uint16_t *) hg_proc->checksum_hash,
+                *(const hg_uint16_t *) hash);
+        else if (hg_proc->checksum_size == sizeof(hg_uint32_t))
+            HG_LOG_ERROR("checksum 0x%08X does not match (expected 0x%08X!)",
+                *(hg_uint32_t *) hg_proc->checksum_hash,
+                *(const hg_uint32_t *) hash);
+        else if (hg_proc->checksum_size == sizeof(hg_uint64_t))
+            HG_LOG_ERROR("checksum 0x%016X does not match (expected 0x%016X!)",
+                *(hg_uint64_t *) hg_proc->checksum_hash,
+                *(const hg_uint64_t *) hash);
+        else
+            HG_LOG_ERROR("Checksums do not match (unknown size?)");
+        ret = HG_CHECKSUM_ERROR;
+        goto done;
     }
 
 done:

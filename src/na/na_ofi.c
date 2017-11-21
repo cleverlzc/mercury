@@ -849,13 +849,25 @@ na_ofi_getinfo(const char *prov_name, struct fi_info **providers)
     }
 
     /* mode: operational mode, NA_OFI passes in context for communication calls. */
-    hints->mode          = FI_CONTEXT;
+    /* FI_ASYNC_IOV mode indicates  that  the  application  must  provide  the
+       buffering needed for the IO vectors. When set, an application must not
+       modify an IO vector  of  length  >  1, including  any  related  memory
+       descriptor array, until the associated operation has completed. */
+    hints->mode          = FI_CONTEXT | FI_ASYNC_IOV;
 
     /* ep_type: reliable datagram (connection-less). */
     hints->ep_attr->type = FI_EP_RDM;
 
     /* caps: capabilities required. */
     hints->caps          = FI_TAGGED | FI_RMA;
+
+    /* NB. verbs does not support FI_DIRECTED_RECV, this is okay for now as the
+     * tag passed to the NA expected recv is already unique per RPC. Note though
+     * that nothing at the NA level guarantees that the tag passed will be
+     * unique, this is an assumption based on the current upper HG core layer.
+     */
+    if (strcmp(prov_name, NA_OFI_PROV_VERBS_NAME))
+        hints->caps     |= FI_DIRECTED_RECV;
 
     /**
      * msg_order: guarantee that messages with same tag are ordered.
@@ -864,8 +876,11 @@ na_ofi_getinfo(const char *prov_name, struct fi_info **providers)
      *  to other message send. If not set, message sends may be transmitted out
      *  of order from their submission).
      */
-    //hints->tx_attr->msg_order = FI_ORDER_SAS;
-    //hints->rx_attr->msg_order = FI_ORDER_SAS;
+    hints->tx_attr->msg_order = FI_ORDER_SAS;
+    hints->tx_attr->comp_order = FI_ORDER_NONE; /* No send completion order */
+    /* Generate completion event when it is safe to re-use buffer */
+    hints->tx_attr->op_flags = FI_INJECT_COMPLETE | FI_COMPLETION;
+    hints->rx_attr->op_flags = FI_COMPLETION;
 
     hints->domain_attr->threading       = FI_THREAD_UNSPEC;
     hints->domain_attr->av_type         = FI_AV_MAP;
@@ -887,7 +902,6 @@ na_ofi_getinfo(const char *prov_name, struct fi_info **providers)
         hints->domain_attr->control_progress = FI_PROGRESS_AUTO;
         hints->domain_attr->data_progress    = FI_PROGRESS_AUTO;
     } else {
-        /* FI_MR_BASIC */
         hints->domain_attr->mr_mode = NA_OFI_MR_BASIC_REQ | FI_MR_LOCAL;
 
         /* Manual progress (no internal progress thread) */
@@ -1030,7 +1044,8 @@ na_ofi_verify_provider(const char *prov_name, const char *domain_name,
      * checking the domain name as well */
     if (!strcmp(prov_name, NA_OFI_PROV_SOCKETS_NAME)) {
         /* Does not match domain name */
-        if (domain_name && strcmp(domain_name, fi_info->domain_attr->name))
+        if (domain_name && strcmp("\0", domain_name)
+            && strcmp(domain_name, fi_info->domain_attr->name))
             goto out;
     }
 
@@ -1457,7 +1472,6 @@ no_wait_obj:
 out:
     return ret;
 }
-
 
 /*---------------------------------------------------------------------------*/
 static na_return_t
@@ -4005,11 +4019,16 @@ na_ofi_cancel(na_class_t *na_class, na_context_t *context,
         break;
     }
 
-    /* signal the cq to make the wait FD can work */
-    rc = fi_cq_signal(cq_hdl);
-    if (rc != 0 && rc != -ENOSYS)
-        NA_LOG_DEBUG("fi_cq_signal (op type %d) failed, rc: %d(%s).",
-            na_ofi_op_id->noo_type, rc, fi_strerror((int) -rc));
+    /* Work around segfault from verbs provider */
+    if (NA_OFI_PRIVATE_DATA(na_class)->nop_domain->nod_prov_type
+        != NA_OFI_PROV_VERBS) {
+        /* signal the cq to make the wait FD can work */
+        rc = fi_cq_signal(cq_hdl);
+        if (rc != 0 && rc != -ENOSYS)
+            NA_LOG_DEBUG("fi_cq_signal (op type %d) failed, rc: %d(%s).",
+                na_ofi_op_id->noo_type, rc, fi_strerror((int) -rc));
+    }
+
 out:
     return ret;
 }

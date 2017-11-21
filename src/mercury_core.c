@@ -9,10 +9,7 @@
  */
 
 #include "mercury_core.h"
-
-#include "mercury_proc_header.h"
-#include "mercury_proc.h"
-#include "mercury_bulk.h"
+#include "mercury_core_header.h"
 #include "mercury_private.h"
 #include "mercury_error.h"
 
@@ -31,8 +28,10 @@
 #include "mercury_event.h"
 #endif
 #include "mercury_atomic_queue.h"
+#include "mercury_mem.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 /****************/
 /* Local Macros */
@@ -45,19 +44,16 @@
 
 /* Remove warnings when routine does not use arguments */
 #if defined(__cplusplus)
-    #define HG_UNUSED
+# define HG_UNUSED
 #elif defined(__GNUC__) && (__GNUC__ >= 4)
-    #define HG_UNUSED __attribute__((unused))
+# define HG_UNUSED __attribute__((unused))
 #else
-    #define HG_UNUSED
+# define HG_UNUSED
 #endif
 
 /************************************/
 /* Local Type and Struct Definition */
 /************************************/
-
-/* Private callback type for HG layer */
-typedef hg_return_t (*handle_create_cb_t)(hg_class_t *, hg_handle_t);
 
 /* HG class */
 struct hg_class {
@@ -69,13 +65,25 @@ struct hg_class {
     unsigned int na_max_tag_msb;        /* MSB of NA max tag */
     hg_bool_t use_tag_mask;             /* Can use tag masking or not */
     hg_bool_t na_ext_init;              /* NA externally initialized */
-    handle_create_cb_t handle_create_callback; /* Callback executed on hg_core_create */
 #ifdef HG_HAS_SELF_FORWARD
     hg_thread_pool_t *self_processing_pool; /* Thread pool for self processing */
 #endif
     hg_atomic_int32_t n_contexts;       /* Atomic used for number of contexts */
     hg_atomic_int32_t n_addrs;          /* Atomic used for number of addrs */
     hg_int32_t max_contexts;            /* Max number of contexts */
+
+    /* Callbacks */
+    hg_return_t (*create)(
+        hg_class_t *hg_class,
+        hg_handle_t handle
+        ); /* handle_create */
+    hg_return_t (*more_data_acquire)(
+        hg_handle_t,
+        hg_return_t (*done_callback)(hg_handle_t)
+        ); /* more_data_acquire */
+    void (*more_data_release)(
+        hg_handle_t
+        ); /* more_data_release */
 };
 
 /* HG context */
@@ -110,7 +118,6 @@ struct hg_context {
 /* Info for function map */
 struct hg_rpc_info {
     hg_rpc_cb_t rpc_cb;             /* RPC callback */
-    hg_bool_t no_response;          /* RPC response not expected */
     void *data;                     /* User data */
     void (*free_callback)(void *);  /* User data free callback */
 };
@@ -140,14 +147,15 @@ struct hg_handle {
     void *arg;                          /* Callback arguments */
     hg_cb_type_t cb_type;               /* Callback type */
     na_tag_t tag;                       /* Tag used for request and response */
-    hg_uint32_t cookie;                 /* Cookie unique to every RPC call */
+    hg_uint8_t cookie;                  /* Cookie */
     hg_return_t ret;                    /* Return code associated to handle */
     HG_LIST_ENTRY(hg_handle) entry;     /* Entry in pending / processing lists */
     struct hg_completion_entry hg_completion_entry; /* Entry in completion queue */
     hg_bool_t repost;                   /* Repost handle on completion (listen) */
     hg_bool_t process_rpc_cb;           /* RPC callback must be processed */
-    hg_bool_t is_self;                  /* Handle self processed */
-    hg_atomic_int32_t in_use;           /* Handle is in use */
+    hg_bool_t is_self;                  /* Self processed */
+    hg_atomic_int32_t in_use;           /* Is in use */
+    hg_bool_t no_response;              /* Require response or not */
 
     void *in_buf;                       /* Input buffer */
     void *in_buf_plugin_data;           /* Input buffer NA plugin data */
@@ -162,24 +170,30 @@ struct hg_handle {
 
     na_op_id_t na_send_op_id;           /* Operation ID for send */
     na_op_id_t na_recv_op_id;           /* Operation ID for recv */
-    hg_atomic_int32_t na_completed_count; /* Number of NA operations completed */
+    unsigned int na_op_count;           /* Number of ongoing operations */
+    hg_atomic_int32_t na_op_completed_count; /* Number of NA operations completed */
     hg_bool_t na_op_id_mine;            /* Operation ID created by HG */
 
     hg_atomic_int32_t ref_count;        /* Reference count */
 
-    void *extra_in_buf;
-    hg_size_t extra_in_buf_size;
-    hg_op_id_t extra_in_op_id;
-
-    struct hg_header_request in_header; /* Input header */
-    struct hg_header_response out_header; /* Output header */
+    struct hg_core_header in_header;    /* Input header */
+    struct hg_core_header out_header;   /* Output header */
 
     struct hg_rpc_info *hg_rpc_info;    /* Associated RPC info */
-    hg_bool_t no_response;              /* Require response or not */
     void *private_data;                 /* Private data */
     void (*private_free_callback)(void *); /* Private data free callback */
 
     struct hg_thread_work thread_work;  /* Used for self processing and testing */
+
+    /* Callbacks */
+    hg_return_t (*forward)(
+        struct hg_handle *hg_handle
+        ); /* forward */
+    hg_return_t (*respond)(
+        struct hg_handle *hg_handle,
+        hg_cb_t callback,
+        void *arg
+        ); /* respond */
 };
 
 /* HG op id */
@@ -205,22 +219,60 @@ struct hg_op_id {
 /********************/
 
 /**
- * Get extra user payload using bulk transfer.
- * TODO this may be moved to the upper mercury layer.
+ * Equal function for function map.
  */
-static hg_return_t
-hg_core_get_extra_input(
-        struct hg_handle *hg_handle,
-        hg_bulk_t extra_in_handle
+static HG_INLINE int
+hg_core_int_equal(
+        void *vlocation1,
+        void *vlocation2
         );
 
 /**
- * Bulk transfer callback.
+ * Hash function for function map.
  */
-static hg_return_t
-hg_core_get_extra_input_cb(
-        const struct hg_cb_info *callback_info
+static HG_INLINE unsigned int
+hg_core_int_hash(
+        void *vlocation
         );
+
+/**
+ * Free function for value in function map.
+ */
+static void
+hg_core_func_map_value_free(
+        hg_hash_table_value_t value
+        );
+
+/**
+ * Find tag most significant bit.
+ */
+static HG_INLINE unsigned int
+hg_core_tag_msb(
+        na_tag_t tag
+        );
+
+/**
+ * Generate a new tag.
+ */
+static HG_INLINE na_tag_t
+hg_core_gen_request_tag(
+        struct hg_class *hg_class,
+        struct hg_handle *hg_handle
+        );
+
+/**
+ * Retrieve usable buffer to store input payload.
+ */
+static HG_INLINE void
+hg_core_get_input(struct hg_handle *hg_handle, void **in_buf,
+    hg_size_t *in_buf_size);
+
+/**
+ * Retrieve usable buffer to store output payload.
+ */
+static HG_INLINE void
+hg_core_get_output(struct hg_handle *hg_handle, void **out_buf,
+    hg_size_t *out_buf_size);
 
 /**
  * Proc request header and verify it if decoded.
@@ -228,9 +280,8 @@ hg_core_get_extra_input_cb(
 static HG_INLINE hg_return_t
 hg_core_proc_header_request(
         struct hg_handle *hg_handle,
-        struct hg_header_request *request_header,
-        hg_proc_op_t op,
-        hg_size_t *extra_header_size
+        struct hg_core_header *hg_core_header,
+        hg_proc_op_t op
         );
 
 /**
@@ -239,7 +290,7 @@ hg_core_proc_header_request(
 static HG_INLINE hg_return_t
 hg_core_proc_header_response(
         struct hg_handle *hg_handle,
-        struct hg_header_response *response_header,
+        struct hg_core_header *hg_core_header,
         hg_proc_op_t op
         );
 
@@ -276,23 +327,6 @@ hg_core_init(
 static hg_return_t
 hg_core_finalize(
         struct hg_class *hg_class
-        );
-
-/**
- * Set handle create callback.
- */
-void
-hg_core_set_handle_create_callback(
-        struct hg_class *hg_class,
-        handle_create_cb_t handle_create_callback
-        );
-
-/**
- * Get NA context.
- */
-na_context_t *
-hg_core_get_na_context(
-        struct hg_context *context
         );
 
 /**
@@ -339,7 +373,6 @@ hg_core_addr_free(
         struct hg_class *hg_class,
         struct hg_addr *hg_addr
         );
-
 
 /**
  * Self addr.
@@ -404,24 +437,6 @@ hg_core_set_rpc(
         struct hg_handle *hg_handle,
         hg_addr_t addr,
         hg_id_t id
-        );
-
-/**
- * Set private data.
- */
-void
-hg_core_set_private_data(
-        struct hg_handle *hg_handle,
-        void *private_data,
-        void (*private_free_callback)(void *)
-        );
-
-/**
- * Get private data.
- */
-void *
-hg_core_get_private_data(
-        struct hg_handle *hg_handle
         );
 
 /**
@@ -497,6 +512,15 @@ hg_core_recv_input_cb(
         );
 
 /**
+ * Process input.
+ */
+static hg_return_t
+hg_core_process_input(
+        struct hg_handle *hg_handle,
+        hg_bool_t *completed
+        );
+
+/**
  * Send output callback.
  */
 static int
@@ -512,6 +536,15 @@ hg_core_recv_output_cb(
         const struct na_cb_info *callback_info
         );
 
+/**
+ * Process output.
+ */
+static hg_return_t
+hg_core_process_output(
+        struct hg_handle *hg_handle,
+        hg_bool_t *completed
+        );
+
 #ifdef HG_HAS_SELF_FORWARD
 /**
  * Wrapper for local callback execution.
@@ -524,7 +557,7 @@ hg_core_self_cb(
 /**
  * Process handle thread (used for self execution).
  */
-static HG_THREAD_RETURN_TYPE
+static HG_INLINE HG_THREAD_RETURN_TYPE
 hg_core_process_thread(
         void *arg
         );
@@ -541,7 +574,7 @@ hg_core_process(
 /**
  * Complete handle and add to completion queue.
  */
-static hg_return_t
+static HG_INLINE hg_return_t
 hg_core_complete(
         struct hg_handle *hg_handle
         );
@@ -678,9 +711,6 @@ hg_core_cancel(
 /*******************/
 
 /*---------------------------------------------------------------------------*/
-/**
- * Equal function for function map.
- */
 static HG_INLINE int
 hg_core_int_equal(void *vlocation1, void *vlocation2)
 {
@@ -688,9 +718,6 @@ hg_core_int_equal(void *vlocation1, void *vlocation2)
 }
 
 /*---------------------------------------------------------------------------*/
-/**
- * Hash function for function map.
- */
 static HG_INLINE unsigned int
 hg_core_int_hash(void *vlocation)
 {
@@ -698,10 +725,7 @@ hg_core_int_hash(void *vlocation)
 }
 
 /*---------------------------------------------------------------------------*/
-/**
- * Free function for value in function map.
- */
-static HG_INLINE void
+static void
 hg_core_func_map_value_free(hg_hash_table_value_t value)
 {
     struct hg_rpc_info *hg_rpc_info = (struct hg_rpc_info *) value;
@@ -712,9 +736,6 @@ hg_core_func_map_value_free(hg_hash_table_value_t value)
 }
 
 /*---------------------------------------------------------------------------*/
-/**
- * Find tag most significant bit.
- */
 static HG_INLINE unsigned int
 hg_core_tag_msb(na_tag_t tag)
 {
@@ -727,14 +748,10 @@ hg_core_tag_msb(na_tag_t tag)
 }
 
 /*---------------------------------------------------------------------------*/
-/**
- * Generate a new tag.
- */
 static HG_INLINE na_tag_t
 hg_core_gen_request_tag(struct hg_class *hg_class,
     struct hg_handle *hg_handle)
 {
-    na_tag_t tag = 0;
     na_tag_t request_tag = 0;
 
     /* Compare and swap tag if reached max tag */
@@ -745,12 +762,10 @@ hg_core_gen_request_tag(struct hg_class *hg_class,
     }
 
     /* Use handle target ID if tag mask is enabled */
-    tag = (hg_handle->hg_info.target_id && hg_class->use_tag_mask) ?
+    return (hg_handle->hg_info.target_id && hg_class->use_tag_mask) ?
         (na_tag_t) (hg_handle->hg_info.target_id << (hg_class->na_max_tag_msb
             + 1 - HG_CORE_MASK_NBITS)) | request_tag
         : request_tag;
-
-    return tag;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -758,17 +773,12 @@ static HG_INLINE void
 hg_core_get_input(struct hg_handle *hg_handle, void **in_buf,
     hg_size_t *in_buf_size)
 {
-    hg_size_t header_offset = hg_proc_header_request_get_size() +
+    hg_size_t header_offset = hg_core_header_request_get_size() +
         hg_handle->na_in_header_offset;
 
-    /* Space must be left for request header, no offset if extra buffer since
-     * only the user payload is copied */
-    *in_buf =
-        (hg_handle->extra_in_buf) ? hg_handle->extra_in_buf :
-            ((char *) hg_handle->in_buf + header_offset);
-    *in_buf_size =
-        (hg_handle->extra_in_buf_size) ? hg_handle->extra_in_buf_size :
-            (hg_handle->in_buf_size - header_offset);
+    /* Space must be left for request header */
+    *in_buf = (char *) hg_handle->in_buf + header_offset;
+    *in_buf_size = hg_handle->in_buf_size - header_offset;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -776,7 +786,7 @@ static HG_INLINE void
 hg_core_get_output(struct hg_handle *hg_handle, void **out_buf,
     hg_size_t *out_buf_size)
 {
-    hg_size_t header_offset = hg_proc_header_response_get_size() +
+    hg_size_t header_offset = hg_core_header_response_get_size() +
         hg_handle->na_out_header_offset;
 
     /* Space must be left for response header */
@@ -785,71 +795,9 @@ hg_core_get_output(struct hg_handle *hg_handle, void **out_buf,
 }
 
 /*---------------------------------------------------------------------------*/
-static hg_return_t
-hg_core_get_extra_input(struct hg_handle *hg_handle, hg_bulk_t extra_in_handle)
-{
-    hg_class_t *hg_class = hg_handle->hg_info.hg_class;
-    hg_context_t *hg_context = hg_handle->hg_info.context;
-    hg_bulk_t local_in_handle = HG_BULK_NULL;
-    hg_return_t ret = HG_SUCCESS;
-
-    /* Create a new local handle to read the data */
-    hg_handle->extra_in_buf_size = HG_Bulk_get_size(extra_in_handle);
-    hg_handle->extra_in_buf = calloc(hg_handle->extra_in_buf_size, sizeof(char));
-    if (!hg_handle->extra_in_buf) {
-        HG_LOG_ERROR("Could not allocate extra input buffer");
-        ret = HG_NOMEM_ERROR;
-        goto done;
-    }
-
-    ret = HG_Bulk_create(hg_class, 1, &hg_handle->extra_in_buf,
-            &hg_handle->extra_in_buf_size, HG_BULK_READWRITE, &local_in_handle);
-    if (ret != HG_SUCCESS) {
-        HG_LOG_ERROR("Could not create HG bulk handle");
-        goto done;
-    }
-
-    /* Read bulk data here and wait for the data to be here  */
-    ret = HG_Bulk_transfer(hg_context, hg_core_get_extra_input_cb,
-            hg_handle, HG_BULK_PULL, hg_handle->hg_info.addr,
-            hg_handle->hg_info.target_id, extra_in_handle,
-            0, local_in_handle, 0, hg_handle->extra_in_buf_size,
-            &hg_handle->extra_in_op_id);
-    if (ret != HG_SUCCESS) {
-        HG_LOG_ERROR("Could not transfer bulk data");
-        goto done;
-    }
-
-done:
-    HG_Bulk_free(local_in_handle);
-    HG_Bulk_free(extra_in_handle);
-    return ret;
-}
-
-/*---------------------------------------------------------------------------*/
-static hg_return_t
-hg_core_get_extra_input_cb(const struct hg_cb_info *callback_info)
-{
-    struct hg_handle *hg_handle = (struct hg_handle *) callback_info->arg;
-    hg_return_t ret = HG_SUCCESS;
-
-    /* Now can process the handle */
-    hg_handle->process_rpc_cb = HG_TRUE;
-    ret = hg_core_complete(hg_handle);
-    if (ret != HG_SUCCESS) {
-        HG_LOG_ERROR("Could not complete rpc handle");
-        goto done;
-    }
-
-done:
-    return ret;
-}
-
-/*---------------------------------------------------------------------------*/
 static HG_INLINE hg_return_t
 hg_core_proc_header_request(struct hg_handle *hg_handle,
-    struct hg_header_request *request_header, hg_proc_op_t op,
-    hg_size_t *extra_header_size)
+    struct hg_core_header *hg_core_header, hg_proc_op_t op)
 {
     char *header_buf = (char *) hg_handle->in_buf +
         hg_handle->na_in_header_offset;
@@ -858,15 +806,15 @@ hg_core_proc_header_request(struct hg_handle *hg_handle,
     hg_return_t ret = HG_SUCCESS;
 
     /* Proc request header */
-    ret = hg_proc_header_request(header_buf, header_buf_size,
-        request_header, op, hg_handle->hg_info.hg_class, extra_header_size);
+    ret = hg_core_header_request_proc(op, header_buf, header_buf_size,
+        hg_core_header);
     if (ret != HG_SUCCESS) {
         HG_LOG_ERROR("Could not process request header");
         goto done;
     }
 
     if (op == HG_DECODE) {
-        ret = hg_proc_header_request_verify(request_header);
+        ret = hg_core_header_request_verify(hg_core_header);
         if (ret != HG_SUCCESS) {
             HG_LOG_ERROR("Could not verify request header");
             goto done;
@@ -877,11 +825,10 @@ done:
     return ret;
 }
 
-
 /*---------------------------------------------------------------------------*/
 static HG_INLINE hg_return_t
 hg_core_proc_header_response(struct hg_handle *hg_handle,
-    struct hg_header_response *response_header, hg_proc_op_t op)
+    struct hg_core_header *hg_core_header, hg_proc_op_t op)
 {
     char *header_buf = (char *) hg_handle->out_buf +
         hg_handle->na_out_header_offset;
@@ -890,15 +837,15 @@ hg_core_proc_header_response(struct hg_handle *hg_handle,
     hg_return_t ret = HG_SUCCESS;
 
     /* Proc response header */
-    ret = hg_proc_header_response(header_buf, header_buf_size,
-        response_header, op);
+    ret = hg_core_header_response_proc(op, header_buf, header_buf_size,
+        hg_core_header);
     if (ret != HG_SUCCESS) {
         HG_LOG_ERROR("Could not process response header");
         goto done;
     }
 
     if (op == HG_DECODE) {
-        ret = hg_proc_header_response_verify(response_header);
+        ret = hg_core_header_response_verify(hg_core_header);
         if (ret != HG_SUCCESS) {
             HG_LOG_ERROR("Could not verify response header");
             goto done;
@@ -1109,21 +1056,6 @@ done:
     free(hg_class);
 
     return ret;
-}
-
-/*---------------------------------------------------------------------------*/
-void
-hg_core_set_handle_create_callback(struct hg_class *hg_class,
-    handle_create_cb_t handle_create_callback)
-{
-    hg_class->handle_create_callback = handle_create_callback;
-}
-
-/*---------------------------------------------------------------------------*/
-na_context_t *
-hg_core_get_na_context(struct hg_context *context)
-{
-    return context->na_context;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -1435,8 +1367,8 @@ hg_core_create(struct hg_context *context)
     NA_Msg_init_expected(na_class, hg_handle->out_buf, hg_handle->out_buf_size);
 
     /* Init in/out header */
-    hg_proc_header_request_init(&hg_handle->in_header);
-    hg_proc_header_response_init(&hg_handle->out_header);
+    hg_core_header_request_init(&hg_handle->in_header);
+    hg_core_header_response_init(&hg_handle->out_header);
 
     /* Create NA operation IDs */
     hg_handle->na_send_op_id = NA_Op_create(na_class);
@@ -1450,7 +1382,8 @@ hg_core_create(struct hg_context *context)
         }
         hg_handle->na_op_id_mine = HG_TRUE;
     }
-    hg_atomic_init32(&hg_handle->na_completed_count, 0);
+    hg_handle->na_op_count = 1; /* Default (no response) */
+    hg_atomic_init32(&hg_handle->na_op_completed_count, 0);
 
     /* Set refcount to 1 */
     hg_atomic_init32(&hg_handle->ref_count, 1);
@@ -1458,10 +1391,10 @@ hg_core_create(struct hg_context *context)
     /* Increment N handles from HG context */
     hg_atomic_incr32(&context->n_handles);
 
-    /* Execute context callback on handle, this allows upper layers to allocate
+    /* Execute class callback on handle, this allows upper layers to allocate
      * private data on handle creation */
-    if (context->hg_class->handle_create_callback) {
-        ret = context->hg_class->handle_create_callback(context->hg_class,
+    if (context->hg_class->create) {
+        ret = context->hg_class->create(context->hg_class,
             (hg_handle_t) hg_handle);
         if (ret != HG_SUCCESS) {
             HG_LOG_ERROR("Error in HG handle create callback");
@@ -1505,8 +1438,8 @@ hg_core_destroy(struct hg_handle *hg_handle)
     if (na_ret != NA_SUCCESS)
         HG_LOG_ERROR("Could not destroy NA op ID");
 
-    hg_proc_header_request_finalize(&hg_handle->in_header);
-    hg_proc_header_response_finalize(&hg_handle->out_header);
+    hg_core_header_request_finalize(&hg_handle->in_header);
+    hg_core_header_response_finalize(&hg_handle->out_header);
 
     na_ret = NA_Msg_buf_free(hg_handle->hg_info.hg_class->na_class,
         hg_handle->in_buf, hg_handle->in_buf_plugin_data);
@@ -1517,7 +1450,10 @@ hg_core_destroy(struct hg_handle *hg_handle)
     if (na_ret != NA_SUCCESS)
         HG_LOG_ERROR("Could not destroy NA output msg buffer");
 
-    free(hg_handle->extra_in_buf);
+    /* Free extra data here if needed */
+    if (hg_handle->hg_info.hg_class->more_data_release)
+        hg_handle->hg_info.hg_class->more_data_release(
+            (hg_handle_t) hg_handle);
 
     if (hg_handle->private_free_callback)
         hg_handle->private_free_callback(hg_handle->private_data);
@@ -1562,16 +1498,17 @@ hg_core_reset(struct hg_handle *hg_handle, hg_bool_t reset_info)
     hg_handle->ret = HG_SUCCESS;
     hg_handle->in_buf_used = 0;
     hg_handle->out_buf_used = 0;
-    hg_atomic_set32(&hg_handle->na_completed_count, 0);
-    if (hg_handle->extra_in_buf) {
-        free(hg_handle->extra_in_buf);
-        hg_handle->extra_in_buf = NULL;
-    }
-    hg_handle->extra_in_buf_size = 0;
-    hg_handle->extra_in_op_id = HG_OP_ID_NULL;
+    hg_handle->na_op_count = 1; /* Default (no response) */
+    hg_atomic_set32(&hg_handle->na_op_completed_count, 0);
+    hg_handle->no_response = HG_FALSE;
 
-    hg_proc_header_request_reset(&hg_handle->in_header);
-    hg_proc_header_response_reset(&hg_handle->out_header);
+    /* Free extra data here if needed */
+    if (hg_handle->hg_info.hg_class->more_data_release)
+        hg_handle->hg_info.hg_class->more_data_release(
+            (hg_handle_t) hg_handle);
+
+    hg_core_header_request_reset(&hg_handle->in_header);
+    hg_core_header_response_reset(&hg_handle->out_header);
 
 done:
     return ret;
@@ -1581,17 +1518,27 @@ done:
 static hg_return_t
 hg_core_set_rpc(struct hg_handle *hg_handle, hg_addr_t addr, hg_id_t id)
 {
+    struct hg_info *hg_info = &hg_handle->hg_info;
     hg_return_t ret = HG_SUCCESS;
 
     /* We allow for NULL addr to be passed at creation time, this allows
      * for pool of handles to be created and later re-used after a call to
      * HG_Core_reset() */
-    if (addr != HG_ADDR_NULL && hg_handle->hg_info.addr != addr) {
-        if (hg_handle->hg_info.addr != HG_ADDR_NULL)
-             hg_core_addr_free(hg_handle->hg_info.hg_class,
-                               hg_handle->hg_info.addr);
-        hg_handle->hg_info.addr = addr;
+    if (addr != HG_ADDR_NULL && hg_info->addr != addr) {
+        if (hg_info->addr != HG_ADDR_NULL)
+             hg_core_addr_free(hg_info->hg_class, hg_info->addr);
+        hg_info->addr = addr;
         hg_atomic_incr32(&addr->ref_count); /* Increase ref to addr */
+
+        /* Set forward call depending on address self */
+        hg_handle->is_self = NA_Addr_is_self(hg_info->hg_class->na_class,
+            hg_info->addr->na_addr);
+#ifdef HG_HAS_SELF_FORWARD
+        hg_handle->forward = hg_handle->is_self ? hg_core_forward_self :
+            hg_core_forward_na;
+#else
+        hg_handle->forward = hg_core_forward_na;
+#endif
     }
 
     /* We also allow for NULL RPC id to be passed (same reason as above) */
@@ -1613,29 +1560,10 @@ hg_core_set_rpc(struct hg_handle *hg_handle, hg_addr_t addr, hg_id_t id)
 
         /* Cache RPC info */
         hg_handle->hg_rpc_info = hg_rpc_info;
-
-        /* Copy no response flag */
-        hg_handle->no_response = hg_rpc_info->no_response;
     }
 
 done:
     return ret;
-}
-
-/*---------------------------------------------------------------------------*/
-void
-hg_core_set_private_data(struct hg_handle *hg_handle, void *private_data,
-    void (*private_free_callback)(void *))
-{
-    hg_handle->private_data = private_data;
-    hg_handle->private_free_callback = private_free_callback;
-}
-
-/*---------------------------------------------------------------------------*/
-void *
-hg_core_get_private_data(struct hg_handle *hg_handle)
-{
-    return hg_handle->private_data;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -1699,8 +1627,11 @@ hg_core_forward_na(struct hg_handle *hg_handle)
     /* Generate tag */
     hg_handle->tag = hg_core_gen_request_tag(hg_class, hg_handle);
 
-    /* Pre-post the recv message (output) if response is expected */
-    if (!hg_handle->hg_rpc_info->no_response) {
+    if (!hg_handle->no_response) {
+        /* Increment number of expected NA operations */
+        hg_handle->na_op_count++;
+
+        /* Pre-post the recv message (output) if response is expected */
         na_ret = NA_Msg_recv_expected(hg_class->na_class, hg_context->na_context,
             hg_core_recv_output_cb, hg_handle, hg_handle->out_buf,
             hg_handle->out_buf_size, hg_handle->out_buf_plugin_data,
@@ -1722,9 +1653,9 @@ hg_core_forward_na(struct hg_handle *hg_handle)
             &hg_handle->na_send_op_id);
     if (na_ret != NA_SUCCESS) {
         HG_LOG_ERROR("Could not post send for input buffer");
-        /* cancel the above posted recv op */
+        /* Cancel the above posted recv op */
         na_ret = NA_Cancel(hg_class->na_class, hg_context->na_context,
-                           hg_handle->na_recv_op_id);
+            hg_handle->na_recv_op_id);
         if (na_ret != NA_SUCCESS) {
             HG_LOG_ERROR("Could not cancel recv op id");
         }
@@ -1792,6 +1723,8 @@ hg_core_respond_na(struct hg_handle *hg_handle, hg_cb_t callback, void *arg)
     hg_handle->arg = arg;
     hg_handle->cb_type = HG_CB_RESPOND;
 
+    /* Post extra buffer expected recv */
+
     /* Respond back */
     na_ret = NA_Msg_send_expected(hg_class->na_class, hg_context->na_context,
             hg_core_send_output_cb, hg_handle, hg_handle->out_buf,
@@ -1804,8 +1737,6 @@ hg_core_respond_na(struct hg_handle *hg_handle, hg_cb_t callback, void *arg)
         goto done;
     }
 
-    /* TODO Handle extra buffer response */
-
 done:
     return ret;
 }
@@ -1815,8 +1746,6 @@ static int
 hg_core_send_input_cb(const struct na_cb_info *callback_info)
 {
     struct hg_handle *hg_handle = (struct hg_handle *) callback_info->arg;
-    /* If we expect a response, there needs to be 2 NA operations in total */
-    int completed_count = hg_handle->no_response ? 1 : 2;
     na_return_t na_ret = NA_SUCCESS;
     int ret = 0;
 
@@ -1833,12 +1762,9 @@ hg_core_send_input_cb(const struct na_cb_info *callback_info)
         goto done;
     }
 
-    /* Add handle to completion queue only when send_input and recv_output have
-     * completed */
-    if (hg_atomic_incr32(&hg_handle->na_completed_count) == completed_count) {
-        /* Reset completed count */
-        hg_atomic_set32(&hg_handle->na_completed_count, 0);
-
+    /* Add handle to completion queue only when all operations have completed */
+    if (hg_atomic_incr32(&hg_handle->na_op_completed_count)
+        == (hg_util_int32_t) hg_handle->na_op_count) {
         /* Mark as completed */
         if (hg_core_complete(hg_handle) != HG_SUCCESS) {
             HG_LOG_ERROR("Could not complete operation");
@@ -1859,10 +1785,13 @@ hg_core_recv_input_cb(const struct na_cb_info *callback_info)
 {
     struct hg_handle *hg_handle = (struct hg_handle *) callback_info->arg;
     struct hg_context *hg_context = hg_handle->hg_info.context;
+    const struct na_cb_info_recv_unexpected *na_cb_info_recv_unexpected =
+        &callback_info->info.recv_unexpected;
 #ifndef HG_HAS_POST_LIMIT
     hg_bool_t pending_empty = NA_FALSE;
 #endif
     na_return_t na_ret = NA_SUCCESS;
+    hg_bool_t completed = HG_FALSE;
     int ret = 0;
 
     /* Reset op ID value */
@@ -1872,93 +1801,128 @@ hg_core_recv_input_cb(const struct na_cb_info *callback_info)
     if (callback_info->ret == NA_CANCELED) {
         /* If canceled, mark handle as canceled */
         hg_handle->ret = HG_CANCELED;
-
         /* May only decrement refcount */
         hg_core_destroy(hg_handle);
-    } else if (callback_info->ret == NA_SUCCESS) {
-        /* Increment NA completed count */
-        hg_atomic_incr32(&hg_handle->na_completed_count);
-
-        /* Fill unexpected info */
-        hg_handle->hg_info.addr->na_addr =
-            callback_info->info.recv_unexpected.source;
-
-        /* TODO determine if addr is local */
-//        hg_handle->hg_info.addr->local = HG_FALSE;
-
-        hg_handle->tag = callback_info->info.recv_unexpected.tag;
-        if (callback_info->info.recv_unexpected.actual_buf_size
-            > hg_handle->in_buf_size) {
-            HG_LOG_ERROR(
-                "Actual transfer size is too large for unexpected recv");
-            goto done;
-        }
-        hg_handle->in_buf_used =
-            callback_info->info.recv_unexpected.actual_buf_size;
-
-        /* Move handle from pending list to processing list */
-        hg_thread_spin_lock(&hg_context->pending_list_lock);
-        HG_LIST_REMOVE(hg_handle, entry);
-#ifndef HG_HAS_POST_LIMIT
-        pending_empty = HG_LIST_IS_EMPTY(&hg_context->pending_list);
-#endif
-        hg_thread_spin_unlock(&hg_context->pending_list_lock);
-
-        hg_thread_spin_lock(&hg_context->processing_list_lock);
-        HG_LIST_INSERT_HEAD(&hg_context->processing_list, hg_handle, entry);
-        hg_thread_spin_unlock(&hg_context->processing_list_lock);
-
-#ifndef HG_HAS_POST_LIMIT
-        /* If pending list is empty, post more handles */
-        if (pending_empty
-            && hg_core_context_post(hg_context, HG_CORE_PENDING_INCR,
-                hg_handle->repost) != HG_SUCCESS) {
-            HG_LOG_ERROR("Could not post additional handles");
-            goto done;
-        }
-#endif
-
-        /* Get and verify header */
-        if (hg_core_proc_header_request(hg_handle, &hg_handle->in_header,
-            HG_DECODE, NULL) != HG_SUCCESS) {
-            HG_LOG_ERROR("Could not get request header");
-            goto done;
-        }
-
-        /* Get operation ID from header */
-        hg_handle->hg_info.id = hg_handle->in_header.id;
-        hg_handle->cookie = hg_handle->in_header.cookie;
-        /* TODO assign target ID from cookie directly for now */
-        hg_handle->hg_info.target_id = hg_handle->cookie & 0xff;
-        hg_handle->no_response = (hg_handle->in_header.flags
-            & HG_PROC_HEADER_NO_RESPONSE) ? HG_TRUE : HG_FALSE;
-
-        /* Get extra payload if flag HG_PROC_HEADER_BULK is set */
-        if ((hg_handle->in_header.flags & HG_PROC_HEADER_BULK_EXTRA)
-            && (hg_handle->in_header.extra_in_handle != HG_BULK_NULL)) {
-            if (hg_core_get_extra_input(hg_handle,
-                hg_handle->in_header.extra_in_handle) != HG_SUCCESS) {
-                HG_LOG_ERROR("Could not get extra input buffer");
-                goto done;
-            }
-        } else {
-            /* Otherwise, mark handle ready for processing */
-            hg_handle->process_rpc_cb = HG_TRUE;
-            if (hg_core_complete(hg_handle) != HG_SUCCESS) {
-                HG_LOG_ERROR("Could not complete rpc handle");
-                goto done;
-            }
-            /* Increment number of entries added to completion queue */
-            ret++;
-        }
-    } else {
+        goto done;
+    } else if (callback_info->ret != NA_SUCCESS) {
         HG_LOG_ERROR("Error in NA callback");
         na_ret = NA_PROTOCOL_ERROR;
         goto done;
     }
 
+    /* Increment NA completed count */
+    hg_atomic_incr32(&hg_handle->na_op_completed_count);
+
+    /* Fill unexpected info */
+    /* TODO determine if addr is local */
+//    hg_handle->hg_info.addr->local = HG_FALSE;
+    hg_handle->hg_info.addr->na_addr = na_cb_info_recv_unexpected->source;
+    hg_handle->tag = na_cb_info_recv_unexpected->tag;
+    if (na_cb_info_recv_unexpected->actual_buf_size > hg_handle->in_buf_size) {
+        HG_LOG_ERROR("Actual transfer size is too large for unexpected recv");
+        goto done;
+    }
+    hg_handle->in_buf_used = na_cb_info_recv_unexpected->actual_buf_size;
+
+    /* Move handle from pending list to processing list */
+    hg_thread_spin_lock(&hg_context->pending_list_lock);
+    HG_LIST_REMOVE(hg_handle, entry);
+#ifndef HG_HAS_POST_LIMIT
+    pending_empty = HG_LIST_IS_EMPTY(&hg_context->pending_list);
+#endif
+    hg_thread_spin_unlock(&hg_context->pending_list_lock);
+
+    hg_thread_spin_lock(&hg_context->processing_list_lock);
+    HG_LIST_INSERT_HEAD(&hg_context->processing_list, hg_handle, entry);
+    hg_thread_spin_unlock(&hg_context->processing_list_lock);
+
+#ifndef HG_HAS_POST_LIMIT
+    /* If pending list is empty, post more handles */
+    if (pending_empty && hg_core_context_post(hg_context, HG_CORE_PENDING_INCR,
+        hg_handle->repost) != HG_SUCCESS) {
+        HG_LOG_ERROR("Could not post additional handles");
+        goto done;
+    }
+#endif
+
+    /* Process input information */
+    if (hg_core_process_input(hg_handle, &completed) != HG_SUCCESS) {
+        HG_LOG_ERROR("Could not process input");
+        goto done;
+    }
+
+    /* Increment number of entries added to completion queue */
+    ret = (int) completed;
+
 done:
     (void) na_ret;
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static hg_return_t
+hg_core_process_input(struct hg_handle *hg_handle, hg_bool_t *completed)
+{
+    struct hg_context *hg_context = hg_handle->hg_info.context;
+    hg_return_t ret = HG_SUCCESS;
+
+    /* Get and verify input header */
+    ret = hg_core_proc_header_request(hg_handle, &hg_handle->in_header,
+        HG_DECODE);
+    if (ret != HG_SUCCESS) {
+        HG_LOG_ERROR("Could not get request header");
+        goto done;
+    }
+
+    /* Get operation ID from header */
+    hg_handle->hg_info.id = hg_handle->in_header.msg.request.id;
+    hg_handle->cookie = hg_handle->in_header.msg.request.cookie;
+    /* TODO assign target ID from cookie directly for now */
+    hg_handle->hg_info.target_id = hg_handle->cookie;
+
+    /* Parse flags */
+    hg_handle->no_response = hg_handle->in_header.msg.request.flags
+        & HG_CORE_NO_RESPONSE;
+    if (!hg_handle->no_response) {
+        /* Increment number of expected NA operations */
+        hg_handle->na_op_count++;
+    }
+#ifdef HG_HAS_SELF_FORWARD
+    hg_handle->respond = hg_handle->in_header.msg.request.flags
+        & HG_CORE_SELF_FORWARD ? hg_core_respond_self : hg_core_respond_na;
+#else
+    hg_handle->respond = hg_core_respond_na;
+#endif
+
+    /* Now mark handle as ready to be processed */
+    hg_handle->process_rpc_cb = HG_TRUE;
+
+    /* Must let upper layer get extra payload if HG_CORE_MORE_DATA is set */
+    if (hg_handle->in_header.msg.request.flags & HG_CORE_MORE_DATA) {
+        if (!hg_context->hg_class->more_data_acquire) {
+            HG_LOG_ERROR("No callback defined for acquiring more data");
+            ret = HG_PROTOCOL_ERROR;
+            goto done;
+        }
+        ret = hg_context->hg_class->more_data_acquire((hg_handle_t) hg_handle,
+            hg_core_complete);
+        if (ret != HG_SUCCESS) {
+            HG_LOG_ERROR("Error in HG handle more data acquire callback");
+            goto done;
+        }
+        if (completed)
+            *completed = HG_FALSE;
+    } else {
+        ret = hg_core_complete(hg_handle);
+        if (ret != HG_SUCCESS) {
+            HG_LOG_ERROR("Could not complete operation");
+            goto done;
+        }
+        if (completed)
+            *completed = HG_TRUE;
+    }
+
+done:
     return ret;
 }
 
@@ -1990,18 +1954,20 @@ hg_core_send_output_cb(const struct na_cb_info *callback_info)
     HG_LIST_REMOVE(hg_handle, entry);
     hg_thread_spin_unlock(&hg_handle->hg_info.context->processing_list_lock);
 
-    /* Mark as completed (sanity check: NA completed count should be 2 here) */
-    if (hg_atomic_incr32(&hg_handle->na_completed_count) == 2) {
-        /* Reset completed count */
-        hg_atomic_set32(&hg_handle->na_completed_count, 0);
-
-        if (hg_core_complete(hg_handle) != HG_SUCCESS) {
-            HG_LOG_ERROR("Could not complete operation");
-            goto done;
-        }
-        /* Increment number of entries added to completion queue */
-        ret++;
+    /* Mark as completed (sanity check for NA op completed count) */
+    if (hg_atomic_incr32(&hg_handle->na_op_completed_count)
+        != (hg_util_int32_t) hg_handle->na_op_count) {
+        HG_LOG_ERROR("Invalid NA operation count (completed %d, expected %u)",
+            hg_atomic_get32(&hg_handle->na_op_completed_count),
+            hg_handle->na_op_count);
     }
+
+    if (hg_core_complete(hg_handle) != HG_SUCCESS) {
+        HG_LOG_ERROR("Could not complete operation");
+        goto done;
+    }
+    /* Increment number of entries added to completion queue */
+    ret++;
 
 done:
     (void) na_ret;
@@ -2024,24 +1990,20 @@ hg_core_recv_output_cb(const struct na_cb_info *callback_info)
         /* If canceled, mark handle as canceled */
         hg_handle->ret = HG_CANCELED;
     } else if (callback_info->ret == NA_SUCCESS) {
-        /* Decode response header */
-        if (hg_core_proc_header_response(hg_handle, &hg_handle->out_header,
-            HG_DECODE) != HG_SUCCESS) {
-            HG_LOG_ERROR("Could not decode header");
+        if (hg_core_process_output(hg_handle, NULL) != HG_SUCCESS) {
+            HG_LOG_ERROR("Could not process output");
             goto done;
         }
-        hg_handle->ret = (hg_return_t) hg_handle->out_header.ret_code;
     } else {
         HG_LOG_ERROR("Error in NA callback");
         na_ret = NA_PROTOCOL_ERROR;
         goto done;
     }
 
-    /* Add handle to completion queue only when send_input and recv_output have
-     * completed, 2 NA operations in total */
-    if (hg_atomic_incr32(&hg_handle->na_completed_count) == 2) {
-        /* Reset completed count */
-        hg_atomic_set32(&hg_handle->na_completed_count, 0);
+    /* Add handle to completion queue only when all operations have completed */
+    if (hg_atomic_incr32(&hg_handle->na_op_completed_count)
+        == (hg_util_int32_t) hg_handle->na_op_count) {
+        hg_bool_t completed = HG_TRUE;
 
         /* Mark as completed */
         if (hg_core_complete(hg_handle) != HG_SUCCESS) {
@@ -2049,11 +2011,62 @@ hg_core_recv_output_cb(const struct na_cb_info *callback_info)
             goto done;
         }
         /* Increment number of entries added to completion queue */
-        ret++;
+        ret = (int) completed;
     }
 
 done:
     (void) na_ret;
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+static hg_return_t
+hg_core_process_output(struct hg_handle *hg_handle, hg_bool_t *completed)
+{
+//    struct hg_context *hg_context = hg_handle->hg_info.context;
+    hg_return_t ret = HG_SUCCESS;
+
+    /* Get and verify output header */
+    if (hg_core_proc_header_response(hg_handle, &hg_handle->out_header,
+        HG_DECODE) != HG_SUCCESS) {
+        HG_LOG_ERROR("Could not decode header");
+        goto done;
+    }
+
+    /* Get return code from header */
+    hg_handle->ret = (hg_return_t) hg_handle->out_header.msg.response.ret_code;
+
+    /* Parse flags */
+
+    /* Must let upper layer get extra payload if HG_CORE_MORE_DATA is set */
+    if (hg_handle->out_header.msg.response.flags & HG_CORE_MORE_DATA) {
+//        if (!hg_context->hg_class->more_data_acquire) {
+//            HG_LOG_ERROR("No callback defined for acquiring more data");
+//            ret = HG_PROTOCOL_ERROR;
+//            goto done;
+//        }
+//        ret = hg_context->hg_class->more_data_acquire((hg_handle_t) hg_handle,
+//            hg_core_complete);
+//        if (ret != HG_SUCCESS) {
+//            HG_LOG_ERROR("Error in HG handle more data acquire callback");
+//            goto done;
+//        }
+        HG_LOG_ERROR("Cannot process extra output");
+        if (completed)
+            *completed = HG_FALSE;
+        goto done;
+    }
+//    else {
+//        ret = hg_core_complete(hg_handle);
+//        if (ret != HG_SUCCESS) {
+//            HG_LOG_ERROR("Could not complete operation");
+//            goto done;
+//        }
+//        if (completed)
+//            *completed = HG_TRUE;
+//    }
+
+done:
     return ret;
 }
 
@@ -2102,41 +2115,17 @@ done:
 }
 
 /*---------------------------------------------------------------------------*/
-static HG_THREAD_RETURN_TYPE
+static HG_INLINE HG_THREAD_RETURN_TYPE
 hg_core_process_thread(void *arg)
 {
     hg_thread_ret_t thread_ret = (hg_thread_ret_t) 0;
     struct hg_handle *hg_handle = (struct hg_handle *) arg;
 
-    /* Get and verify header */
-    if (hg_core_proc_header_request(hg_handle, &hg_handle->in_header,
-        HG_DECODE, NULL) != HG_SUCCESS) {
-        HG_LOG_ERROR("Could not get request header");
-        goto done;
-    }
+    /* Process input */
+   if (hg_core_process_input(hg_handle, NULL) != HG_SUCCESS) {
+       HG_LOG_ERROR("Could not process input");
+   }
 
-    /* Check extra arguments */
-    if ((hg_handle->in_header.flags & HG_PROC_HEADER_BULK_EXTRA)
-            && (hg_handle->in_header.extra_in_handle != HG_BULK_NULL)) {
-        /* Get extra payload */
-        if (hg_core_get_extra_input(hg_handle, hg_handle->in_header.extra_in_handle)
-                != HG_SUCCESS) {
-            HG_LOG_ERROR("Could not get extra input buffer");
-            goto done;
-        }
-    } else {
-        hg_return_t ret;
-
-        /* Process handle */
-        hg_handle->process_rpc_cb = HG_TRUE;
-        ret = hg_core_complete(hg_handle);
-        if (ret != HG_SUCCESS) {
-            HG_LOG_ERROR("Could not complete rpc handle");
-            goto done;
-        }
-    }
-
-done:
     return thread_ret;
 }
 #endif
@@ -2152,7 +2141,7 @@ hg_core_process(struct hg_handle *hg_handle)
     /* Retrieve exe function from function map */
     hg_thread_spin_lock(&hg_class->func_map_lock);
     hg_rpc_info = (struct hg_rpc_info *) hg_hash_table_lookup(
-            hg_class->func_map, (hg_hash_table_key_t) &hg_handle->hg_info.id);
+        hg_class->func_map, (hg_hash_table_key_t) &hg_handle->hg_info.id);
     hg_thread_spin_unlock(&hg_class->func_map_lock);
     if (!hg_rpc_info) {
         HG_LOG_WARNING("Could not find RPC ID in function map");
@@ -2185,7 +2174,7 @@ done:
 }
 
 /*---------------------------------------------------------------------------*/
-static hg_return_t
+static HG_INLINE hg_return_t
 hg_core_complete(struct hg_handle *hg_handle)
 {
     struct hg_context *context = hg_handle->hg_info.context;
@@ -2340,7 +2329,6 @@ hg_core_reset_post(struct hg_handle *hg_handle)
     /* Also reset additional handle parameters */
     hg_atomic_set32(&hg_handle->ref_count, 1);
     hg_handle->hg_rpc_info = NULL;
-    hg_handle->no_response = HG_FALSE;
 
     /* Safe to repost */
     ret = hg_core_post(hg_handle);
@@ -2706,11 +2694,12 @@ hg_core_trigger_entry(struct hg_handle *hg_handle)
         /* Run RPC callback */
         ret = hg_core_process(hg_handle);
         if (ret != HG_SUCCESS && !hg_handle->no_response) {
-            hg_size_t header_size = hg_proc_header_response_get_size() +
+            hg_size_t header_size = hg_core_header_response_get_size() +
                 hg_handle->na_out_header_offset;
 
             /* Respond in case of error */
-            ret = HG_Core_respond(hg_handle, NULL, NULL, ret, header_size);
+            hg_handle->ret = ret;
+            ret = HG_Core_respond(hg_handle, NULL, NULL, 0, header_size);
             if (ret != HG_SUCCESS) {
                 HG_LOG_ERROR("Could not respond");
                 goto done;
@@ -2887,6 +2876,47 @@ HG_Core_cleanup(void)
 }
 
 /*---------------------------------------------------------------------------*/
+hg_return_t
+HG_Core_set_create_callback(struct hg_class *hg_class,
+    hg_return_t (*create_callback)(hg_class_t *hg_class, hg_handle_t handle))
+{
+    hg_return_t ret = HG_SUCCESS;
+
+    if (!hg_class) {
+        HG_LOG_ERROR("NULL HG class");
+        ret = HG_INVALID_PARAM;
+        goto done;
+    }
+
+    hg_class->create = create_callback;
+
+done:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+hg_return_t
+HG_Core_set_more_data_callback(struct hg_class *hg_class,
+    hg_return_t (*more_data_acquire_callback)(hg_handle_t,
+        hg_return_t (*done_callback)(hg_handle_t)),
+    void (*more_data_release_callback)(hg_handle_t))
+{
+    hg_return_t ret = HG_SUCCESS;
+
+    if (!hg_class) {
+        HG_LOG_ERROR("NULL HG class");
+        ret = HG_INVALID_PARAM;
+        goto done;
+    }
+
+    hg_class->more_data_acquire = more_data_acquire_callback;
+    hg_class->more_data_release = more_data_release_callback;
+
+done:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
 const char *
 HG_Core_class_get_name(const hg_class_t *hg_class)
 {
@@ -2949,7 +2979,7 @@ HG_Core_class_get_input_eager_size(const hg_class_t *hg_class)
     }
 
     unexp  = NA_Msg_get_max_unexpected_size(hg_class->na_class);
-    header = hg_proc_header_request_get_size() +
+    header = hg_core_header_request_get_size() +
         NA_Msg_get_unexpected_header_size(hg_class->na_class);
     if (unexp > header)
         ret = unexp - header;
@@ -2970,7 +3000,7 @@ HG_Core_class_get_output_eager_size(const hg_class_t *hg_class)
     }
 
     exp    = NA_Msg_get_max_expected_size(hg_class->na_class);
-    header = hg_proc_header_response_get_size() +
+    header = hg_core_header_response_get_size() +
         NA_Msg_get_expected_header_size(hg_class->na_class);
     if (exp > header)
         ret = exp - header;
@@ -3240,6 +3270,23 @@ HG_Core_context_get_class(const hg_context_t *context)
 }
 
 /*---------------------------------------------------------------------------*/
+na_context_t *
+HG_Core_context_get_na(const hg_context_t *context)
+{
+    na_context_t *ret = NULL;
+
+    if (!context) {
+        HG_LOG_ERROR("NULL HG context");
+        goto done;
+    }
+
+    ret = context->na_context;
+
+ done:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
 hg_uint8_t
 HG_Core_context_get_id(const hg_context_t *context)
 {
@@ -3357,7 +3404,6 @@ HG_Core_register(hg_class_t *hg_class, hg_id_t id, hg_rpc_cb_t rpc_cb)
         }
 
         hg_rpc_info->rpc_cb = rpc_cb;
-        hg_rpc_info->no_response = HG_FALSE;
         hg_rpc_info->data = NULL;
         hg_rpc_info->free_callback = NULL;
 
@@ -3464,34 +3510,6 @@ HG_Core_registered_data(hg_class_t *hg_class, hg_id_t id)
 
 done:
    return data;
-}
-
-/*---------------------------------------------------------------------------*/
-hg_return_t
-HG_Core_registered_disable_response(hg_class_t *hg_class, hg_id_t id,
-    hg_bool_t disable)
-{
-    struct hg_rpc_info *hg_rpc_info = NULL;
-    hg_return_t ret = HG_SUCCESS;
-
-    if (!hg_class) {
-        HG_LOG_ERROR("NULL HG class");
-        ret = HG_INVALID_PARAM;
-        goto done;
-    }
-
-    hg_thread_spin_lock(&hg_class->func_map_lock);
-    hg_rpc_info = (struct hg_rpc_info *) hg_hash_table_lookup(
-        hg_class->func_map, (hg_hash_table_key_t) &id);
-    hg_thread_spin_unlock(&hg_class->func_map_lock);
-    if (!hg_rpc_info) {
-        HG_LOG_ERROR("Could not find RPC ID in function map");
-        goto done;
-    }
-    hg_rpc_info->no_response = disable;
-
-done:
-    return ret;
 }
 
 /*---------------------------------------------------------------------------*/
@@ -3769,6 +3787,45 @@ done:
 }
 
 /*---------------------------------------------------------------------------*/
+hg_return_t
+HG_Core_set_private_data(hg_handle_t handle, void *data,
+    void (*free_callback)(void *))
+{
+    struct hg_handle *hg_handle = (struct hg_handle *) handle;
+    hg_return_t ret = HG_SUCCESS;
+
+    if (!hg_handle) {
+        HG_LOG_ERROR("NULL pointer to HG handle");
+        ret = HG_INVALID_PARAM;
+        goto done;
+    }
+
+    hg_handle->private_data = data;
+    hg_handle->private_free_callback = free_callback;
+
+done:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+void *
+HG_Core_get_private_data(hg_handle_t handle)
+{
+    struct hg_handle *hg_handle = (struct hg_handle *) handle;
+    void *ret = NULL;
+
+    if (!hg_handle) {
+        HG_LOG_ERROR("NULL pointer to HG handle");
+        goto done;
+    }
+
+    ret = hg_handle->private_data;
+
+done:
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
 const struct hg_info *
 HG_Core_get_info(hg_handle_t handle)
 {
@@ -3849,13 +3906,6 @@ HG_Core_get_output(hg_handle_t handle, void **out_buf, hg_size_t *out_buf_size)
         goto done;
     }
 
-    /* Cannot respond if no_response flag set */
-    if (hg_handle->no_response) {
-        HG_LOG_ERROR("No output was produced on that RPC (no response)");
-        ret = HG_PROTOCOL_ERROR;
-        goto done;
-    }
-
     hg_core_get_output(hg_handle, out_buf, out_buf_size);
 
 done:
@@ -3865,16 +3915,11 @@ done:
 /*---------------------------------------------------------------------------*/
 hg_return_t
 HG_Core_forward(hg_handle_t handle, hg_cb_t callback, void *arg,
-    hg_bulk_t extra_in_handle, hg_size_t size_to_send)
+    hg_uint8_t flags, hg_size_t payload_size)
 {
     struct hg_handle *hg_handle = (struct hg_handle *) handle;
-#ifdef HG_HAS_SELF_FORWARD
-    hg_return_t (*hg_forward)(struct hg_handle *hg_handle);
-#endif
-    hg_return_t ret = HG_SUCCESS;
     hg_size_t header_size;
-    hg_size_t extra_header_size = 0;
-    hg_uint8_t flags = 0;
+    hg_return_t ret = HG_SUCCESS;
 
     if (!hg_handle) {
         HG_LOG_ERROR("NULL handle");
@@ -3899,39 +3944,51 @@ HG_Core_forward(hg_handle_t handle, hg_cb_t callback, void *arg,
         goto done;
     }
 #endif
+    /* Reset op counts */
+    hg_handle->na_op_count = 1; /* Default (no response) */
+    hg_atomic_set32(&hg_handle->na_op_completed_count, 0);
+
+    /* Set header size */
+    header_size = hg_core_header_request_get_size() +
+        hg_handle->na_in_header_offset;
+
+    /* Set the actual size of the msg that needs to be transmitted */
+    hg_handle->in_buf_used = header_size + payload_size;
+    if (hg_handle->in_buf_used > hg_handle->in_buf_size) {
+        HG_LOG_ERROR("Exceeding input buffer size");
+        ret = HG_SIZE_ERROR;
+        goto done;
+    }
+
+    /* Parse flags */
+    if (flags & HG_CORE_NO_RESPONSE)
+        hg_handle->no_response = HG_TRUE;
+    if (hg_handle->is_self)
+        flags |= HG_CORE_SELF_FORWARD;
+
     /* Set callback */
     hg_handle->callback = callback;
     hg_handle->arg = arg;
     hg_handle->cb_type = HG_CB_FORWARD;
 
     /* Set header */
-    header_size = hg_proc_header_request_get_size() +
-        hg_handle->na_in_header_offset;
-    hg_handle->in_header.id = hg_handle->hg_info.id;
+    hg_handle->in_header.msg.request.id = hg_handle->hg_info.id;
+    hg_handle->in_header.msg.request.flags = flags;
     /*
      * Set the in_header.cookie as origin context's target_id, so at target side
      * the cookie is unpacked and assign to hg_handle->hg_info.target_id, so can
      * make NA layer can know which target id to send the response.
      */
-    /* hg_handle->in_header.cookie = hg_handle->hg_info.target_id; */
-    hg_handle->in_header.cookie = HG_Core_context_get_id(hg_handle->hg_info.context);
-    hg_handle->in_header.extra_in_handle = extra_in_handle;
-    flags = (extra_in_handle != HG_BULK_NULL) ? HG_PROC_HEADER_BULK_EXTRA : 0;
-    hg_handle->in_header.flags |= flags;
-    flags = (hg_handle->no_response) ? HG_PROC_HEADER_NO_RESPONSE : 0;
-    hg_handle->in_header.flags |= flags;
+    /* hg_handle->in_header.msg.request.cookie = hg_handle->hg_info.target_id; */
+    hg_handle->in_header.msg.request.cookie = HG_Core_context_get_id(hg_handle->hg_info.context);
 
     /* Encode request header */
     ret = hg_core_proc_header_request(hg_handle, &hg_handle->in_header,
-        HG_ENCODE, &extra_header_size);
+        HG_ENCODE);
     if (ret != HG_SUCCESS) {
         HG_LOG_ERROR("Could not encode header");
         goto done;
     }
-    header_size += extra_header_size;
-
-    /* Set the actual size of the msg that needs to be transmitted */
-    hg_handle->in_buf_used = header_size + size_to_send;
 
     /* Increase ref count here so that a call to HG_Destroy does not free the
      * handle but only schedules its completion
@@ -3943,15 +4000,7 @@ HG_Core_forward(hg_handle_t handle, hg_cb_t callback, void *arg,
 
     /* If addr is self, forward locally, otherwise send the encoded buffer
      * through NA and pre-post response */
-#ifdef HG_HAS_SELF_FORWARD
-    hg_handle->is_self = NA_Addr_is_self(hg_handle->hg_info.hg_class->na_class,
-        hg_handle->hg_info.addr->na_addr);
-    hg_forward =  hg_handle->is_self ? hg_core_forward_self :
-        hg_core_forward_na;
-    ret = hg_forward(hg_handle);
-#else
-    ret = hg_core_forward_na(hg_handle);
-#endif
+    ret = hg_handle->forward(hg_handle);
     if (ret != HG_SUCCESS) {
         HG_LOG_ERROR("Could not forward buffer");
         /* Handle is no longer in use */
@@ -3968,13 +4017,9 @@ done:
 /*---------------------------------------------------------------------------*/
 hg_return_t
 HG_Core_respond(hg_handle_t handle, hg_cb_t callback, void *arg,
-    hg_return_t ret_code, hg_size_t size_to_send)
+    hg_uint8_t flags, hg_size_t payload_size)
 {
     struct hg_handle *hg_handle = (struct hg_handle *) handle;
-#ifdef HG_HAS_SELF_FORWARD
-    hg_return_t (*hg_respond)(struct hg_handle *hg_handle, hg_cb_t callback,
-            void *arg);
-#endif
     hg_size_t header_size;
     hg_return_t ret = HG_SUCCESS;
 
@@ -3998,16 +4043,22 @@ HG_Core_respond(hg_handle_t handle, hg_cb_t callback, void *arg,
         goto done;
     }
 
-    /* Set error code if any */
-    hg_handle->ret = ret_code;
-
     /* Set header size */
-    header_size = hg_proc_header_response_get_size() +
+    header_size = hg_core_header_response_get_size() +
         hg_handle->na_out_header_offset;
 
-    /* Fill the header */
-    hg_handle->out_header.cookie = hg_handle->cookie;
-    hg_handle->out_header.ret_code = hg_handle->ret;
+    /* Set the actual size of the msg that needs to be transmitted */
+    hg_handle->out_buf_used = header_size + payload_size;
+    if (hg_handle->out_buf_used > hg_handle->out_buf_size) {
+        HG_LOG_ERROR("Exceeding output buffer size");
+        ret = HG_SIZE_ERROR;
+        goto done;
+    }
+
+    /* Set header */
+    hg_handle->out_header.msg.response.ret_code = hg_handle->ret;
+    hg_handle->out_header.msg.response.flags = flags;
+    hg_handle->out_header.msg.response.cookie = hg_handle->cookie;
 
     /* Encode response header */
     ret = hg_core_proc_header_response(hg_handle, &hg_handle->out_header,
@@ -4017,19 +4068,9 @@ HG_Core_respond(hg_handle_t handle, hg_cb_t callback, void *arg,
         goto done;
     }
 
-    /* Set the actual size of the msg that needs to be transmitted */
-    hg_handle->out_buf_used = header_size + size_to_send;
-
     /* If addr is self, forward locally, otherwise send the encoded buffer
      * through NA and pre-post response */
-#ifdef HG_HAS_SELF_FORWARD
-    hg_respond = NA_Addr_is_self(hg_handle->hg_info.hg_class->na_class,
-            hg_handle->hg_info.addr->na_addr) ? hg_core_respond_self :
-            hg_core_respond_na;
-    ret = hg_respond(hg_handle, callback, arg);
-#else
-    ret = hg_core_respond_na(hg_handle, callback, arg);
-#endif
+    ret = hg_handle->respond(hg_handle, callback, arg);
     if (ret != HG_SUCCESS) {
         HG_LOG_ERROR("Could not respond");
         goto done;

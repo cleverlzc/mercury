@@ -33,6 +33,10 @@ if(MERCURY_TESTING_VERIFY_DATA)
 endif()
 mark_as_advanced(MERCURY_TESTING_VERIFY_DATA)
 
+option(MERCURY_TESTING_PRINT_PARTIAL
+  "Print partial results between loops (disable when measuring)." OFF)
+mark_as_advanced(MERCURY_TESTING_PRINT_PARTIAL)
+
 option(MERCURY_ENABLE_PARALLEL_TESTING
   "Enable testing in parallel (requires MPI)." OFF)
 if(MERCURY_ENABLE_PARALLEL_TESTING OR NA_USE_MPI)
@@ -106,7 +110,6 @@ configure_file(
 include_directories(
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}
-  ${MERCURY_INCLUDES_BUILD_TIME}
 )
 
 if(MERCURY_ENABLE_PARALLEL_TESTING)
@@ -194,24 +197,18 @@ endmacro()
 function(add_mercury_test test_name)
   foreach(comm ${NA_PLUGINS})
     string(TOUPPER ${comm} upper_comm)
-    if(NA_${upper_comm}_TESTING_PROTOCOL)
-      foreach(protocol ${NA_${upper_comm}_TESTING_PROTOCOL})
-        add_mercury_test_comm(${test_name} ${comm} ${protocol} "")
-      endforeach()
-    endif()
+    foreach(protocol ${NA_${upper_comm}_TESTING_PROTOCOL})
+      add_mercury_test_comm(${test_name} ${comm} ${protocol} "")
+    endforeach()
   endforeach()
 endfunction()
 
 function(add_mercury_opt_test test_name opt)
   foreach(comm ${NA_PLUGINS})
     string(TOUPPER ${comm} upper_comm)
-    if(NA_${upper_comm}_TESTING_PROTOCOL)
-      foreach(protocol ${NA_${upper_comm}_TESTING_PROTOCOL})
-        add_mercury_test_comm(${test_name} ${comm} ${protocol} ${opt})
-      endforeach()
-    else()
-      add_mercury_test_comm(${test_name} ${comm} "" ${opt})
-    endif()
+    foreach(protocol ${NA_${upper_comm}_TESTING_PROTOCOL})
+      add_mercury_test_comm(${test_name} ${comm} ${protocol} ${opt})
+    endforeach()
   endforeach()
 endfunction()
 
@@ -247,14 +244,19 @@ set(MERCURY_tests
   bulk
   bulk_seg
 #  pipeline
-  perf
-  overflow
+#  perf
+#  overflow
 #  cancel
 )
 if(NOT WIN32)
   set(MERCURY_tests ${MERCURY_tests} posix)
 endif()
 build_mercury_test(nested)
+build_mercury_test(overflow)
+build_mercury_test(perf)
+build_mercury_test(rpc_lat)
+build_mercury_test(write_bw)
+build_mercury_test(read_bw)
 
 # Build tests and add them to ctest
 foreach(MERCURY_test ${MERCURY_tests})

@@ -2442,7 +2442,7 @@ static na_return_t
 na_sm_initialize(na_class_t *na_class, const struct na_info NA_UNUSED *na_info,
     na_bool_t listen, const struct na_init_info NA_UNUSED *init_info)
 {
-    static unsigned int id = 0;
+    static hg_atomic_int32_t id = HG_ATOMIC_VAR_INIT(0);
     struct na_sm_addr *na_sm_addr = NULL;
     pid_t pid;
     hg_poll_set_t *poll_set;
@@ -2486,7 +2486,7 @@ na_sm_initialize(na_class_t *na_class, const struct na_info NA_UNUSED *na_info,
     }
     memset(na_sm_addr, 0, sizeof(struct na_sm_addr));
     na_sm_addr->pid = pid;
-    na_sm_addr->id = id++; /* TODO check that */
+    na_sm_addr->id = (unsigned int) hg_atomic_incr32(&id) - 1;
     na_sm_addr->self = NA_TRUE;
     hg_atomic_init32(&na_sm_addr->ref_count, 1);
     /* If we're listening, create a new shm region */

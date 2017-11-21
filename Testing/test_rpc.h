@@ -11,14 +11,20 @@
 #ifndef TEST_RPC_H
 #define TEST_RPC_H
 
+#include "mercury_core.h"
 #include "mercury_macros.h"
 #include "mercury_proc_string.h"
-
-#ifdef HG_HAS_BOOST
 
 typedef struct {
     hg_uint64_t cookie;
 } rpc_handle_t;
+
+typedef struct {
+    void *buf;
+    hg_uint32_t buf_size;
+} perf_rpc_lat_in_t;
+
+#ifdef HG_HAS_BOOST
 
 /* 1. Generate processor and struct for additional struct types
  * MERCURY_GEN_STRUCT_PROC( struct_type_name, fields )
@@ -34,11 +40,6 @@ MERCURY_GEN_STRUCT_PROC( rpc_handle_t, ((hg_uint64_t)(cookie)) )
 MERCURY_GEN_PROC( rpc_open_in_t, ((hg_const_string_t)(path)) ((rpc_handle_t)(handle)) )
 MERCURY_GEN_PROC( rpc_open_out_t, ((hg_int32_t)(ret)) ((hg_int32_t)(event_id)) )
 #else
-/* Define rpc_handle_t */
-typedef struct {
-    hg_uint64_t cookie;
-} rpc_handle_t;
-
 /* Dummy function that needs to be shipped (already defined) */
 /* int rpc_open(const char *path, rpc_handle_t handle, int *event_id); */
 
@@ -114,5 +115,58 @@ hg_proc_rpc_open_out_t(hg_proc_t proc, void *data)
     return ret;
 }
 #endif
+
+/* Define hg_proc_perf_rpc_lat_in_t */
+static HG_INLINE hg_return_t
+hg_proc_perf_rpc_lat_in_t(hg_proc_t proc, void *data)
+{
+    perf_rpc_lat_in_t *struct_data = (perf_rpc_lat_in_t *) data;
+    hg_return_t ret = HG_SUCCESS;
+
+    ret = hg_proc_hg_uint32_t(proc, &struct_data->buf_size);
+    if (ret != HG_SUCCESS) {
+        HG_LOG_ERROR("Proc error");
+        return ret;
+    }
+
+    if (struct_data->buf_size) {
+        switch (hg_proc_get_op(proc)) {
+            case HG_DECODE:
+                struct_data->buf = malloc(struct_data->buf_size);
+            case HG_ENCODE:
+                ret = hg_proc_raw(proc, struct_data->buf, struct_data->buf_size);
+                if (ret != HG_SUCCESS) {
+                    HG_LOG_ERROR("Proc error");
+                    return ret;
+                }
+                break;
+            case HG_FREE:
+                free(struct_data->buf);
+                break;
+            default:
+                HG_LOG_ERROR("Proc error");
+                ret = HG_PROTOCOL_ERROR;
+                return ret;
+        }
+
+#ifdef MERCURY_TESTING_HAS_VERIFY_DATA
+        if (hg_proc_get_op(proc) == HG_DECODE) {
+            hg_size_t i;
+            char *buf_ptr = struct_data->buf;
+
+            for (i = 0; i < struct_data->buf_size; i++) {
+                if (buf_ptr[i] != (char) i) {
+                    printf("Error detected in bulk transfer, buf[%d] = %d, "
+                        "was expecting %d!\n", (int) i, (char) buf_ptr[i],
+                        (char) i);
+                    break;
+                }
+            }
+        }
+#endif
+    }
+
+    return ret;
+}
 
 #endif /* TEST_RPC_H */
