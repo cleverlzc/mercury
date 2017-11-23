@@ -1868,6 +1868,7 @@ na_ofi_initialize(na_class_t *na_class, const struct na_info *na_info,
         NA_LOG_ERROR("init_info->max_contexts %d exceed limitation %d.",
             init_info->max_contexts,
             NA_OFI_PRIVATE_DATA(na_class)->nop_domain->nod_max_contexts);
+        ret = NA_INVALID_PARAM;
         goto out;
     } else {
         NA_OFI_PRIVATE_DATA(na_class)->nop_max_contexts =
