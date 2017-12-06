@@ -215,6 +215,7 @@ struct na_ofi_private_data {
     struct na_ofi_reqhdr nop_req_hdr; /* request header */
     na_int32_t nop_contexts; /* number of context */
     na_int32_t nop_max_contexts; /* max number of contexts */
+    na_bool_t nop_listen; /* flag of listening, true for server */
     /* nop_mutex only used for verbs provider as it is not thread safe now */
     hg_thread_mutex_t nop_mutex;
     /* Unexpected op queue for regular endpoint */
@@ -1808,7 +1809,7 @@ out:
 /*---------------------------------------------------------------------------*/
 static na_return_t
 na_ofi_initialize(na_class_t *na_class, const struct na_info *na_info,
-    na_bool_t NA_UNUSED listen, const struct na_init_info *init_info)
+    na_bool_t listen, const struct na_init_info *init_info)
 {
     char node[NA_OFI_MAX_URI_LEN] = {'\0'};
     char domain_name[NA_OFI_MAX_URI_LEN] = {'\0'};
@@ -1856,6 +1857,7 @@ na_ofi_initialize(na_class_t *na_class, const struct na_info *na_info,
     memset(na_class->private_data, 0, sizeof(struct na_ofi_private_data));
 
     /* Initialize queue / mutex */
+    NA_OFI_PRIVATE_DATA(na_class)->nop_listen = listen;
     HG_QUEUE_INIT(&NA_OFI_PRIVATE_DATA(na_class)->nop_unexpected_op_queue);
     hg_thread_spin_init(&NA_OFI_PRIVATE_DATA(na_class)->nop_unexpected_op_lock);
     hg_thread_mutex_init(&NA_OFI_PRIVATE_DATA(na_class)->nop_mutex);
@@ -2334,7 +2336,7 @@ na_ofi_op_destroy(na_class_t NA_UNUSED *na_class, na_op_id_t op_id)
  * "192.168.42.170" and service "4567".
  * Caller should provide the needed buffer for all parameters.
  */
-static na_return_t
+na_return_t
 na_ofi_get_port_info(const char *name, char *node, char *service)
 {
     char *dup_name;
@@ -2438,12 +2440,17 @@ static na_return_t
 na_ofi_addr_lookup(na_class_t *na_class, na_context_t *context,
     na_cb_t callback, void *arg, const char *name, na_op_id_t *op_id)
 {
-    struct na_ofi_domain *domain = NA_OFI_PRIVATE_DATA(na_class)->nop_domain;
     struct na_ofi_op_id *na_ofi_op_id = NULL;
     struct na_ofi_addr *na_ofi_addr = NULL;
-    char node_str[NA_OFI_MAX_NODE_LEN] = {'\0'};
-    char service_str[NA_OFI_MAX_PORT_LEN] = {'\0'};
+    struct na_ofi_reqhdr tmp_reqhdr;
     na_return_t ret = NA_SUCCESS;
+
+    /* Generate a temporary reqhdr to reuse na_ofi_addr_ht_lookup */
+    ret = na_ofi_gen_req_hdr(name, &tmp_reqhdr);
+    if (ret != NA_SUCCESS) {
+        NA_LOG_ERROR("na_ofi_gen_req_hdr(%s) failed, ret: %d.", name, ret);
+        goto out;
+    }
 
     /* Allocate op_id if not provided */
     if (op_id && op_id != NA_OP_ID_IGNORE && *op_id != NA_OP_ID_NULL) {
@@ -2478,27 +2485,12 @@ na_ofi_addr_lookup(na_class_t *na_class, na_context_t *context,
 
     na_ofi_op_id->noo_info.noo_lookup.noi_addr = (na_addr_t) na_ofi_addr;
 
-    ret = na_ofi_get_port_info(name, node_str, service_str);
-    if (ret != NA_SUCCESS) {
-        NA_LOG_ERROR("na_ofi_get_port_info(%s) failed, ret: %d.\n", name, ret);
-        goto out;
-    }
-
     /* Assign op_id */
     if (op_id && op_id != NA_OP_ID_IGNORE) *op_id = (na_op_id_t) na_ofi_op_id;
 
-    /* address resolution by fi AV */
-    /*
-     * TODO: later if concurrent calling of fi_av_insert does not cause probelm
-     * then can remove this lock. Now libfabric internal memory corruption found
-     */
-    hg_thread_rwlock_wrlock(&domain->nod_rwlock);
-    ret = na_ofi_av_insert(na_class, node_str, service_str,
-                           &na_ofi_addr->noa_addr);
-    hg_thread_rwlock_release_wrlock(&domain->nod_rwlock);
+    ret = na_ofi_addr_ht_lookup(na_class, &tmp_reqhdr, &na_ofi_addr->noa_addr);
     if (ret != NA_SUCCESS) {
-        NA_LOG_ERROR("na_ofi_av_insert(%s:%s) failed, ret: %d.",
-                     node_str, service_str, ret);
+        NA_LOG_ERROR("na_ofi_addr_ht_lookup(%s) failed, ret: %d.", name, ret);
         goto out;
     }
 
