@@ -1579,7 +1579,8 @@ na_ofi_endpoint_open(const struct na_ofi_domain *na_ofi_domain,
     }
 
     /* SEP not supported by verbs provider for 1.5.0 */
-    if (na_ofi_domain->nod_prov_type != NA_OFI_PROV_VERBS) {
+    if (na_ofi_domain->nod_prov_type != NA_OFI_PROV_VERBS &&
+        max_contexts > 1) {
         ret = na_ofi_sep_open(na_ofi_domain, na_ofi_endpoint);
         if (ret != NA_SUCCESS) {
             NA_LOG_ERROR("na_ofi_sep_open failed, ret: %d.", ret);
